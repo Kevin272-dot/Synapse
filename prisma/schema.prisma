@@ -9,11 +9,31 @@ datasource db {
 
 model User {
   id        String     @id @default(cuid())
+  clerkId   String     @unique
   email     String     @unique
   name      String
-  password  String
   createdAt DateTime   @default(now())
   updatedAt DateTime   @updatedAt
+  documents Document[]
+  folders   Folder[]
+  concepts  Concept[]
+  edges     ConceptEdge[]
+  sharedWith DocumentShare[]
+}
+
+model Folder {
+  id        String     @id @default(cuid())
+  name      String
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  owner     User       @relation(fields: [ownerId], references: [id])
+  ownerId   String
+
+  // Self-relation: a folder can live inside another folder.
+  parent   Folder?  @relation("FolderTree", fields: [parentId], references: [id])
+  parentId String?
+  children Folder[] @relation("FolderTree")
+
   documents Document[]
 }
 
@@ -21,8 +41,99 @@ model Document {
   id        String   @id @default(cuid())
   title     String   @default("Untitled Document")
   content   String   @default("")
+  // Authoritative plain-text projection used by the real-time OT engine.
+  text      String   @default("")
+  // Access mode: "private" (owner + shares) | "public" (any signed-in user can view).
+  visibility String  @default("private")
+  // Text at version 0 (before the first logged op) — enables replay-based
+  // reconstruction of any version from the operation log.
+  logBaseText String? @db.Text
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   owner     User     @relation(fields: [ownerId], references: [id])
   ownerId   String
+
+  // NULL folderId means the document sits at the root.
+  folder   Folder? @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  folderId String?
+
+  // AI artifacts
+  summary     String?           @db.Text
+  flashcards  Json?
+  quiz        Json?
+  concepts    DocumentConcept[]
+  shares      DocumentShare[]
+  operations  DocumentOperation[]
+}
+
+/// One durably-logged OT operation. version V holds the op that moved the
+/// document from version V-1 to V. The full log enables time-travel,
+/// the audit feed, and offline replay validation.
+model DocumentOperation {
+  id           String   @id @default(cuid())
+  document     Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId   String
+  version      Int
+  op           Json
+  authorUserId String
+  // Denormalized so history survives user deletion.
+  authorName   String
+  createdAt    DateTime @default(now())
+
+  @@unique([documentId, version])
+  @@index([documentId, createdAt])
+}
+
+/// Grants a user access to a document they don't own.
+/// role: "editor" (can edit + collab) | "viewer" (read-only).
+model DocumentShare {
+  id         String   @id @default(cuid())
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  role       String   @default("editor")
+  createdAt  DateTime @default(now())
+
+  @@unique([documentId, userId])
+}
+
+model Concept {
+  id        String   @id @default(cuid())
+  name      String
+  owner     User     @relation(fields: [ownerId], references: [id])
+  ownerId   String
+
+  documents  DocumentConcept[]
+  edgesFrom  ConceptEdge[] @relation("ConceptEdgeFrom")
+  edgesTo    ConceptEdge[] @relation("ConceptEdgeTo")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([ownerId, name])
+}
+
+model DocumentConcept {
+  id         String   @id @default(cuid())
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId String
+  concept    Concept  @relation(fields: [conceptId], references: [id], onDelete: Cascade)
+  conceptId  String
+  count      Int      @default(1)
+
+  @@unique([documentId, conceptId])
+}
+
+model ConceptEdge {
+  id       String  @id @default(cuid())
+  owner    User    @relation(fields: [ownerId], references: [id])
+  ownerId  String
+  from     Concept @relation("ConceptEdgeFrom", fields: [fromId], references: [id], onDelete: Cascade)
+  fromId   String
+  to       Concept @relation("ConceptEdgeTo", fields: [toId], references: [id], onDelete: Cascade)
+  toId     String
+  strength Int     @default(1)
+
+  @@unique([fromId, toId])
 }
