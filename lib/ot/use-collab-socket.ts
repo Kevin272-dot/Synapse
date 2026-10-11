@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import { transform, type Operation } from "@/lib/ot/engine";
+import type { CrdtOp } from "@/lib/crdt/logoot";
 import { EVENTS } from "@/lib/ot/protocol";
 
 export interface CollabPeer {
@@ -45,6 +46,7 @@ export function useCollabSocket({
   enabled,
   getToken,
   onRemote,
+  onRemoteCrdt,
 }: {
   docId: string;
   userId: string;
@@ -53,10 +55,13 @@ export function useCollabSocket({
   /** Returns a Clerk session token; the server verifies it on join. */
   getToken: () => Promise<string | null>;
   onRemote: (op: Operation, cursor?: number | null) => void;
+  /** Called when relayed CRDT ops arrive (crdt-engine documents). */
+  onRemoteCrdt?: (ops: CrdtOp[]) => void;
 }) {
   const socketRef = useRef<Socket | null>(null);
   const [connected, setConnected] = useState(false);
   const [denied, setDenied] = useState<string | null>(null);
+  const [engine, setEngine] = useState<"ot" | "crdt">("ot");
   const [peers, setPeers] = useState<CollabPeer[]>([]);
   const versionRef = useRef(0);
   const pendingRef = useRef<{ id: string; baseVersion: number; op: Operation }[]>([]);
@@ -95,11 +100,16 @@ export function useCollabSocket({
       versionRef.current = payload.version;
       // Clear pending; server is authoritative and we just joined.
       pendingRef.current = [];
+      setEngine(payload.engine === "crdt" ? "crdt" : "ot");
       setPeers(
         (payload.presence ?? []).filter(
           (p: CollabPeer) => p.userId !== userId
         )
       );
+    });
+
+    socket.on(EVENTS.CRDT_APPLIED, (payload: { ops: CrdtOp[] }) => {
+      onRemoteCrdt?.(payload.ops);
     });
 
     socket.on(
@@ -184,6 +194,18 @@ export function useCollabSocket({
     [docId, connected]
   );
 
+  /** Submit Logoot CRDT ops (crdt-engine documents). The server relays
+   *  them without transformation; our own echo is ignored via idempotent
+   *  applyRemote on the server replica. */
+  const submitCrdt = useCallback(
+    (ops: CrdtOp[]) => {
+      const socket = socketRef.current;
+      if (!socket || !connected || ops.length === 0) return;
+      socket.emit(EVENTS.CRDT_OPS, { docId, ops });
+    },
+    [docId, connected]
+  );
+
   const updatePresence = useCallback(
     (cursor?: number | null, selection?: { from: number; to: number } | null) => {
       socketRef.current?.emit(EVENTS.PRESENCE, { docId, cursor, selection });
@@ -191,5 +213,13 @@ export function useCollabSocket({
     [docId]
   );
 
-  return { connected, denied, peers, submitOp, updatePresence };
+  return {
+    connected,
+    denied,
+    engine,
+    peers,
+    submitOp,
+    submitCrdt,
+    updatePresence,
+  };
 }

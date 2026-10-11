@@ -18,6 +18,9 @@ import {
   toJSON,
   type Operation,
 } from "./lib/ot/engine";
+import { Logoot } from "./lib/crdt/logoot";
+import { runKgExtraction } from "./lib/kg";
+import { generateEmbedding } from "./lib/embeddings";
 import { EVENTS, type JoinPayload } from "./lib/ot/protocol";
 
 const dev = process.env.NODE_ENV !== "production";
@@ -32,17 +35,43 @@ interface DocState {
   docId: string;
   text: string;
   version: number;
+  /** Sync engine for this document. */
+  engine: "ot" | "crdt";
+  ownerId: string;
   /**
-   * Tail cache of the durable op log. history[i] moves the doc from
-   * version (historyStart + i) to (historyStart + i + 1).
+   * Tail cache of the durable op log (OT mode). history[i] moves the doc
+   * from version (historyStart + i) to (historyStart + i + 1).
    * The full record lives in the DocumentOperation table.
    */
   history: Operation[];
   historyStart: number;
+  /** CRDT replica (crdt mode) — the authoritative merge state. */
+  rga: Logoot | null;
   saveTimer: ReturnType<typeof setTimeout> | null;
+  /** Quiescence timer for live KG extraction. */
+  kgTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const docs = new Map<string, DocState>();
+
+/** Expose the live-doc registry to server actions (same process). */
+const globalStore = globalThis as unknown as {
+  __synapseDocs?: Map<string, DocState>;
+  __synapseResetEngine?: (docId: string) => void;
+  __synapseIO?: { to: (room: string) => { emit: (event: string, data: unknown) => void } };
+};
+globalStore.__synapseDocs = docs;
+
+/**
+ * Called from server actions when the owner switches a doc's engine:
+ * drops the cached state so the next join re-initializes correctly.
+ * (Actions reach this via the globalThis bridge — server.ts owns the
+ * HTTP/Socket lifecycle and cannot be imported.)
+ */
+function resetDocEngine(docId: string) {
+  docs.delete(docId);
+}
+globalStore.__synapseResetEngine = resetDocEngine;
 
 /** Absolute-version lookup into the tail cache. */
 function historyOp(state: DocState, v: number): Operation | undefined {
@@ -62,7 +91,7 @@ async function getDocState(docId: string): Promise<DocState> {
   const [doc, opRows] = await Promise.all([
     prisma.document.findUnique({
       where: { id: docId },
-      select: { text: true },
+      select: { text: true, syncEngine: true, ownerId: true },
     }),
     prisma.documentOperation.findMany({
       where: { documentId: docId },
@@ -72,18 +101,32 @@ async function getDocState(docId: string): Promise<DocState> {
     }),
   ]);
 
+  const engine: "ot" | "crdt" =
+    doc?.syncEngine === "crdt" ? "crdt" : "ot";
   const tail = opRows.slice().reverse(); // ascending by version
   const version = tail.length > 0 ? tail[tail.length - 1].version : 0;
   const historyStart = tail.length > 0 ? tail[0].version - 1 : 0;
+  const text = doc?.text ?? "";
 
   state = {
     docId,
-    text: doc?.text ?? "",
+    text,
     version,
+    engine,
+    ownerId: doc?.ownerId ?? "",
     history: tail.map((r) => fromJSON(r.op)),
     historyStart,
+    rga: null,
     saveTimer: null,
+    kgTimer: null,
   };
+
+  if (engine === "crdt") {
+    const rga = new Logoot("server");
+    rga.loadText(text);
+    state.rga = rga;
+  }
+
   docs.set(docId, state);
   return state;
 }
@@ -133,6 +176,36 @@ function boundHistory(state: DocState) {
   }
 }
 
+/**
+ * Live KG quiescence: 4 seconds after the last op, extract concepts.
+ * This is the "OT/CRDT stream → quiescence → incremental LLM → graph"
+ * pipeline that makes the knowledge graph live, not batch.
+ */
+function scheduleKg(state: DocState) {
+  if (state.kgTimer) clearTimeout(state.kgTimer);
+  state.kgTimer = setTimeout(async () => {
+    state.kgTimer = null;
+    if (!state.text.trim()) return;
+    try {
+      await runKgExtraction(state.docId, state.text, state.ownerId);
+      // Generate embedding for semantic search (same quiescence window).
+      const emb = await generateEmbedding(state.text);
+      if (emb) {
+        await prisma.document.update({
+          where: { id: state.docId },
+          data: { embedding: emb },
+        }).catch(() => {});
+      }
+      // Broadcast so open graph pages and editors update live.
+      globalStore.__synapseIO?.to(`doc:${state.docId}`).emit("graph:update", {
+        docId: state.docId,
+      });
+    } catch (e) {
+      console.error("[kg] quiescence extraction failed", e);
+    }
+  }, 4000);
+}
+
 app.prepare().then(() => {
   const httpServer = createServer((req, res) => handle(req, res));
   const io = new Server(httpServer, {
@@ -140,6 +213,9 @@ app.prepare().then(() => {
     addTrailingSlash: false,
     cors: { origin: "*" },
   });
+
+  // Expose io so module-scope helpers (e.g. scheduleKg) can broadcast.
+  globalStore.__synapseIO = io;
 
   /** Track presence per room. */
   const presenceByRoom = new Map<string, Map<string, any>>();
@@ -236,6 +312,7 @@ app.prepare().then(() => {
         docId,
         text: state.text,
         version: state.version,
+        engine: state.engine,
         presence: [...presence.values()],
       });
 
@@ -259,6 +336,8 @@ app.prepare().then(() => {
         if (myRole === "viewer") return;
         const { docId, baseVersion, op } = payload;
         const state = await getDocState(docId);
+        // CRDT-engine documents use the dedicated relay below.
+        if (state.engine === "crdt") return;
 
         // Reject ops based on a version we no longer have in the tail cache.
         if (
@@ -287,6 +366,7 @@ app.prepare().then(() => {
         state.history.push(transformed);
         state.version += 1;
         boundHistory(state);
+        scheduleKg(state);
 
         // Durably log the op + resulting text (fire-and-forget).
         persistOperation(
@@ -308,6 +388,53 @@ app.prepare().then(() => {
           originalOpId: payload.clientOpId,
           cursor: myPresence?.cursor ?? null,
           selection: myPresence?.selection ?? null,
+        });
+      }
+    );
+
+    // CRDT relay: apply to the authoritative replica, audit-log, broadcast.
+    // No transformation — that is the entire point of CRDT mode.
+    socket.on(
+      EVENTS.CRDT_OPS,
+      (payload: {
+        docId: string;
+        ops: Parameters<Logoot["applyRemote"]>[0][];
+        authorName?: string;
+      }) => {
+        if (!currentDoc || currentDoc !== payload.docId) return;
+        if (myRole === "viewer") return;
+        const { docId, ops } = payload;
+        const state = docs.get(docId);
+        if (!state || state.engine !== "crdt" || !state.rga) return;
+
+        for (const crdtOp of ops) state.rga.applyRemote(crdtOp);
+        state.text = state.rga.toText();
+        scheduleKg(state);
+
+        // Audit-log the batch under a monotonically increasing version.
+        state.version += 1;
+        void prisma
+          .$transaction([
+            prisma.documentOperation.create({
+              data: {
+                documentId: docId,
+                version: state.version,
+                op: { engine: "crdt", ops: ops } as unknown as object,
+                authorUserId: myPresence?.userId ?? "unknown",
+                authorName: myPresence?.name ?? "Unknown",
+              },
+            }),
+            prisma.document.update({
+              where: { id: docId },
+              data: { text: state.text },
+            }),
+          ])
+          .catch((e) => console.error("[collab] crdt log write failed", e));
+
+        io.to(`doc:${docId}`).emit(EVENTS.CRDT_APPLIED, {
+          docId,
+          ops,
+          clientId: myPresence?.clientId ?? socket.id,
         });
       }
     );

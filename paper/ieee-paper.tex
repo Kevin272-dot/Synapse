@@ -1,0 +1,286 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Synapse: A Real-Time Collaborative Editor with Dual Consistency Engines and a Live AI Knowledge Graph\\
+{\footnotesize \textit{A Systems Integration of Operational Transformation, Logoot CRDT, and Quiescence-Triggered LLM Extraction}}
+}
+
+\author{
+\IEEEauthorblockN{Kevin Daniel}
+\IEEEauthorblockA{\textit{Independent Researcher} \\
+}
+}
+
+\maketitle
+
+\begin{abstract}
+Real-time collaborative editing requires resolving concurrent edits across distributed replicas without data loss or user-perceived lag. Two dominant families of algorithms address this challenge: Operational Transformation (OT), which relies on a central sequencer to reorder concurrent operations, and Conflict-free Replicated Data Types (CRDTs), which guarantee convergence through commutative data structures. This paper presents Synapse, a full-stack collaborative editor that implements both approaches from first principles---a hand-written OT engine and a hand-written Logoot-style CRDT---selectable per document at runtime, behind a single editing surface built on TipTap/ProseMirror. Correctness of both engines is established through randomized property testing: 400+ concurrent operation pairs are transformed in both directions and asserted to converge. Beyond editing, Synapse introduces a live knowledge-graph pipeline in which the operation stream itself triggers quiescence detection (4-second inactivity window), feeding an incremental large language model (LLM) extraction that upserts concepts into a document--concept bipartite graph and broadcasts the result to all connected clients. The system is implemented as a production application with durable operation logging, role-based sharing, and semantic search, demonstrating that the integration of dual consistency models and real-time AI processing is achievable in a single deployable system.
+\end{abstract}
+
+\begin{IEEEkeywords}
+operational transformation, CRDT, collaborative editing, knowledge graph, large language model, quiescence detection, Logoot, property-based testing
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Real-time collaborative editing systems allow multiple geographically distributed users to edit a shared document simultaneously. The central challenge is \emph{convergence}: regardless of the order in which concurrent operations are received at different replicas, all replicas must eventually reach an identical state \cite{ellis1989}. Two algorithmic families dominate the solution space.
+
+\textbf{Operational Transformation (OT)}, first introduced by Ellis and Gibbs \cite{ellis1989} and formalized by Sun and Ellis \cite{sun1998}, represents edits as operations (insert, delete, retain) that are \emph{transformed} against concurrent operations to preserve user intent. OT requires a central server to sequence operations and a well-defined transformation function $\text{transform}(a, b) \rightarrow a'$ such that applying $a'$ after $b$ produces the same result as applying $b$ after $a$.
+
+\textbf{Conflict-free Replicated Data Types (CRDTs)}, formalized by Shapiro et al. \cite{shapiro2011,shapiro2011b}, take the opposite approach: operations are designed to be \emph{commutative}, so replicas converge regardless of delivery order. Logoot, introduced by Weiss et al. \cite{weiss2009}, assigns each character a unique positional identifier generated strictly between its neighbors, guaranteeing convergence without a central sequencer.
+
+Existing systems implement one approach or the other. This paper presents Synapse, which implements both OT and CRDT engines from scratch---without using third-party libraries such as Yjs or ShareDB---and allows the document owner to select the engine per document at runtime. Both engines share the same rich-text editing surface (TipTap), the same durable operation log, and the same pipeline of LLM-driven features.
+
+The second contribution is a \textbf{live knowledge-graph pipeline} integrated with the same operation stream. After a configurable quiescence window (4 seconds of inactivity), the server triggers an incremental LLM extraction that upserts concepts into a document--concept bipartite graph and broadcasts the updated graph to all connected clients. This transforms the knowledge graph from a static, batch-generated artifact into a live view that evolves as users type.
+
+The remainder of this paper is organized as follows: Section~\ref{sec:related} reviews related work; Section~\ref{sec:architecture} presents the system architecture; Sections~\ref{sec:ot} and~\ref{sec:crdt} detail the OT and CRDT engines respectively; Section~\ref{sec:kg} describes the live knowledge-graph pipeline; Section~\ref{sec:results} presents verification results; Section~\ref{sec:discussion} discusses limitations and future work; Section~\ref{sec:conclusion} concludes.
+
+\section{Related Work}\label{sec:related}
+
+\subsection{Operational Transformation}
+
+The dOPT algorithm \cite{ellis1989} introduced the concept of transforming operations against concurrent operations to maintain consistency. The Jupiter system \cite{jupiter1995} refined this into a client--server model with a two-tier transformation architecture. Sun and Ellis \cite{sun1998} provided the definitive survey, identifying the four key properties OT must satisfy: \emph{causality preservation}, \emph{convergence}, \emph{intention preservation}, and \emph{identity preservation}.
+
+\subsection{CRDTs for Text Editing}
+
+Shapiro et al. \cite{shapiro2011} formalized the Strong Eventual Consistency (SEC) model and defined CRDTs as replicated data types whose concurrent operations commute. For text editing, Logoot \cite{weiss2009} assigns positional identifiers generated between neighbors, guaranteeing convergence through identifier total ordering. Unlike OT, CRDTs require no central server and tolerate message reordering and duplication.
+
+\subsection{LLM-Enhanced Applications}
+
+Recent work has explored integrating LLMs into productivity tools, but the integration has typically been request--response (user clicks a button, LLM responds). Synapse's contribution is the \emph{stream-triggered} pattern: the same operation stream that drives collaboration also drives AI processing, making the AI layer a real-time consumer of the editing stream rather than a bolted-on service.
+
+\section{System Architecture}\label{sec:architecture}
+
+\subsection{Overview}
+
+Synapse is deployed as a single Node.js process that serves both the Next.js application (via its request handler) and a Socket.IO server on the same HTTP port. This co-location simplifies deployment (one container, one port) and enables the OT coordinator to share in-memory state with the web server.
+
+\subsection{Data Model}
+
+The Prisma schema captures six domain entities:
+
+\begin{itemize}
+\item \textbf{User}: synced from Clerk on first visit (lazy get-or-create by clerkId).
+\item \textbf{Folder}: self-referential tree for file-system-like organization (arbitrary depth via parentId).
+\item \textbf{Document}: owned by a User, optionally inside a Folder, with rich-text content (TipTap JSON), plain-text projection, visibility (private/public), and sync-engine selection (ot/crdt).
+\item \textbf{DocumentShare}: grants a user access to a document they don't own (role: editor or viewer).
+\item \textbf{Concept} / \textbf{DocumentConcept} / \textbf{ConceptEdge}: the knowledge graph (concept name, document--concept join with frequency, concept--concept relation with strength).
+\item \textbf{DocumentOperation}: the durable operation log (docId, version, op JSON, author, timestamp), unique per (documentId, version).
+\end{itemize}
+
+Every mutation is scoped by the owner's internal ID or by an explicit \texttt{DocumentShare} grant, enforced through a single access-resolution function that returns \texttt{owner}, \texttt{editor}, or \texttt{viewer}.
+
+\subsection{Custom Node Server}
+
+The custom server (\texttt{server.ts}) attaches Socket.IO to the same HTTP server that serves Next.js. On connect, the client presents a Clerk session token; the server verifies it cryptographically via the Clerk Backend API, resolves the internal user, and checks document access before admitting the socket to a per-document room. This ensures the WebSocket layer enforces the same permission model as the HTTP layer.
+
+\section{OT Engine}\label{sec:ot}
+
+\subsection{Operation Model}
+
+An operation is a list of components:
+
+\begin{equation}
+\text{op} = [c_1, c_2, \ldots, c_n], \quad c_i \in \{\text{retain}(n), \text{insert}(s), \text{delete}(n)\}
+\end{equation}
+
+The \texttt{apply} function walks the document left to right, consuming exactly $\text{baseLength}(\text{op}) = \text{length}(\text{doc})$ characters. An operation that does not consume the entire document is rejected.
+
+\subsection{Transform Function}
+
+The core function \texttt{transform(a, b, insertFirst)} produces $a'$, the operation equivalent to $a$ when applied \emph{after} $b$:
+
+\begin{equation}
+\text{apply}(a', \text{apply}(b, D)) = \text{converged result}
+\end{equation}
+
+The rules are:
+\begin{itemize}
+\item $a$ inserts text $\rightarrow$ $a'$ inserts it
+\item $b$ inserts text $\rightarrow$ $a'$ \emph{retains} it (it exists once $b$ is applied)
+\item Both insert at the same position $\rightarrow$ deterministic order by \texttt{insertFirst} flag
+\item $a$ deletes, $b$ retains $\rightarrow$ $a'$ deletes that text
+\item $a$ retains, $b$ deletes $\rightarrow$ $a'$ drops it
+\item Both delete $\rightarrow$ $a'$ drops it
+\end{itemize}
+
+The \texttt{insertFirst} tie-break ensures that concurrent inserts at the same position have a deterministic order across all replicas. The mirror transform uses the opposite flag, guaranteeing that both paths reach the same converged state.
+
+\subsection{Server-Authoritative Sequencing}
+
+The server maintains per-document state: \{text, version, history tail\}. When an operation arrives with \texttt{baseVersion}, the server transforms it against every operation in history after that version, applies it, increments the version, and broadcasts the transformed operation. Clients maintain pending operations and rebase them against incoming remote operations using the same \texttt{transform} function.
+
+\subsection{Convergence Verification}
+
+The convergence property is tested as follows: for each of 8 random seeds, 50 trials generate two random valid operations $a$ and $b$ on the same document. The test asserts:
+
+\begin{equation}
+\text{apply}(\text{transform}(a,b,\text{true}), \text{apply}(b, D)) = \text{apply}(\text{transform}(b,a,\text{false}), \text{apply}(a, D))
+\end{equation}
+
+This is checked for 400+ concurrent-operation pairs across varying document lengths and operation compositions. All tests pass.
+
+\subsection{Durable Operation Log}
+
+Every applied operation is written to the \texttt{DocumentOperation} table in the same transaction that persists the resulting text. The log enables:
+\begin{itemize}
+\item \textbf{Cold-start recovery}: on server restart, the document state is reconstructed from \texttt{logBaseText} $\oplus$ ops 1..N.
+\item \textbf{Audit feed}: a human-readable timeline of who changed what.
+\item \textbf{Version history}: any version $K$ is reconstructed as $\text{logBaseText} \oplus \text{ops } 1..K$.
+\end{itemize}
+
+The log is append-only; the in-memory history is a bounded tail cache (500 operations) with the database as the full record.
+
+\section{CRDT Engine}\label{sec:crdt}
+
+\subsection{Logoot Positional Identifiers}
+
+The CRDT engine implements the Logoot algorithm \cite{weiss2009}: each character (and each tombstone) carries a positional identifier consisting of a list of base-16 digits plus an originating site ID. Identifiers are totally ordered lexicographically, with the site ID providing a deterministic tie-break for equal digit arrays.
+
+When a user inserts a character at position $i$, the system generates an identifier strictly between the identifiers at positions $i-1$ and $i$. The generation algorithm handles four cases:
+\begin{enumerate}
+\item \textbf{Diverging digits}: if the left and right neighbors differ at digit $j$ with a gap $\geq 2$, generate a digit strictly between them.
+\item \textbf{Consecutive digits}: if the gap is exactly 1, descend into the left neighbor's tail, incrementing the first non-maximum digit (never generating digit 0, which is reserved).
+\item \textbf{Left neighbor is a prefix of right}: extend with a digit strictly below the right neighbor's digit at the prefix boundary.
+\item \textbf{No left neighbor}: use the reserved digit 0, guaranteeing unbounded room beneath.
+\end{enumerate}
+
+Because generated digits are always in the range 2--15 (digit 0 is reserved for the escape hatch), there is always unbounded room between any two identifiers. Concurrent inserts at the same gap produce identifiers that are deterministically ordered by the total order on (digits, site) tuples.
+
+\subsection{Integration}
+
+Remote operations are applied by binary-searching the sorted entry array for the identifier's position and inserting or tombstoning. No transformation is needed: the commutative property of Logoot identifiers guarantees convergence regardless of delivery order.
+
+\subsection{Runtime Engine Selection}
+
+The document owner selects the sync engine per document from the Share dialog. When the engine is changed, the server drops its cached state and re-initializes with the selected engine; clients re-join the document room and receive a fresh SYNC message. The engine badge in the editor header indicates the active mode.
+
+\section{Live Knowledge Graph Pipeline}\label{sec:kg}
+
+\subsection{Quiescence Detection}
+
+The server maintains a per-document activity timer that resets after every applied operation (OT or CRDT). When the timer fires after 4 seconds of inactivity, the server triggers an incremental knowledge-graph extraction.
+
+\subsection{Incremental Extraction}
+
+The extraction prompt carries the \emph{previous concept list} alongside the current document text, enabling the LLM to report only new or changed topics. This reduces both token cost and response size compared to full re-extraction.
+
+The LLM (Groq, Llama 3.3 70B) is constrained to produce strict JSON matching a schema: \texttt{\{concepts: [\{name, count\}]\}}. The response is parsed, concepts are capped at 8 per document, and the results are upserted in a Prisma transaction.
+
+\subsection{Graph Projection}
+
+The document--concept bipartite graph is projected onto a document--document graph for visualization: two documents are connected when they share $\geq 1$ topic, with edge weight equal to the number of shared topics. This projection is what keeps the graph readable as the corpus grows---concepts act as implicit bridges between documents, not as individual nodes in a hairball.
+
+\subsection{Live Broadcast}
+
+After extraction succeeds, the server broadcasts a \texttt{graph:update} event to all connected clients. The graph page's client component listens for this event and triggers a debounced server re-render (800ms), so the graph updates in real time without a page reload.
+
+\section{Additional Systems Features}\label{sec:features}
+
+\subsection{Sharing and Visibility}
+
+Documents support three access tiers: \textbf{private} (owner only), \textbf{shared} (owner + invited collaborators with editor or viewer roles), and \textbf{public} (any signed-in user can view). A confirmation modal is required for the sensitive transition from private to public. The access resolution function is the single gate enforced across the page, the socket layer, and all server actions.
+
+\subsection{Semantic Search}
+
+Documents are embedded using Gemini \texttt{text-embedding-004} (768 dimensions) during the quiescence window. Embeddings are stored as JSON arrays and compared using cosine similarity computed in TypeScript. This approach avoids the pgvector extension dependency while remaining efficient for corpus sizes under 10{,}000 documents.
+
+\subsection{Document Import}
+
+Documents can be imported from .docx (converted via mammoth), .html (sanitized via DOMPurify), and .txt files. The sanitization pipeline is a defense against XSS from untrusted document content.
+
+\section{Verification and Results}\label{sec:results}
+
+\subsection{OT Convergence}
+
+The randomized convergence property is tested across 8 seeds $\times$ 50 trials = 400 concurrent-operation pairs. For each pair, the test generates two random valid operations on a random document, transforms them in both directions, applies the results, and asserts equality. All 400 pairs converge.
+
+\subsection{Log Replay}
+
+The durable operation log is tested by simulating a server: 200 random operations are applied sequentially, logged, and then replayed from the base text. The replayed result must exactly equal the final text. Additionally, any suffix of the log must replay cleanly onto its recorded starting length.
+
+\subsection{CRDT Convergence}
+
+The Logoot CRDT is tested with 2- and 3-site simulations (200 rounds each) under randomized insert/delete/replace contention, plus a heavy same-gap test where every site inserts into the same gap simultaneously, and a delete-heavy contention test. All replicas converge in every scenario.
+
+\section{Discussion and Limitations}\label{sec:discussion}
+
+\subsection{Plain-Text OT}
+
+The OT engine operates on the document's plain-text projection. Rich-text formatting (bold, color, font size) is single-user: concurrent formatting changes are not transformed. This is a deliberate scope decision---the paper's contribution is the OT algorithm itself, not rich-text concurrency, which would require ProseMirror-level step transformation.
+
+\subsection{CRDT Positional Intent}
+
+In the Logoot CRDT, concurrent inserts at the same gap are ordered deterministically by their positional identifiers, but this order may not match either user's local cursor intent. This is a known property of Logoot-style CRDTs; the LSEQ and RGA variants address it with different allocation strategies.
+
+\subsection{Single-Node Coordinator}
+
+Socket.IO rooms and per-document state are in-memory on a single Node process. Multi-instance deployment would require a Redis adapter for room pub/sub and state sharing. This limitation is documented; all features work correctly on a single ECS task.
+
+\subsection{Embedding Storage}
+
+Embeddings are stored as JSON arrays rather than pgvector. This simplifies deployment (no extension required) but limits efficient nearest-neighbor search to corpus sizes where linear scan is acceptable ($\sim$10K documents). pgvector integration is the natural next step for larger corpora.
+
+\section{Conclusion and Future Work}\label{sec:conclusion}
+
+Synapse demonstrates that a full-stack collaborative editor with dual consistency engines and a live AI knowledge graph can be built from first principles as a single deployable application. The OT and CRDT engines are implemented without third-party libraries, their convergence is proven through randomized property testing, and the knowledge-graph pipeline transforms the operation stream into a live, incrementally-updated semantic map of the user's knowledge.
+
+Future work includes:
+\begin{enumerate}
+\item \textbf{Rich-text OT}: extending the operation model to ProseMirror steps for concurrent formatting.
+\item \textbf{Suggestion mode}: anchored suggestions in OT coordinates with accept/reject as OT operations.
+\item \textbf{Offline editing}: IndexedDB operation queue with replay-on-reconnect.
+\item \textbf{pgvector integration}: for efficient semantic search at larger corpus sizes.
+\item \textbf{Redis pub/sub}: for horizontal scaling of the Socket.IO layer.
+\item \textbf{Comments}: Google-Docs-style sidebar comments anchored to text ranges.
+\end{enumerate}
+
+\section*{Acknowledgment}
+
+The author thanks the open-source community behind Next.js, Prisma, TipTap, Socket.IO, and Clerk, whose tools made this project possible.
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{10}
+
+\bibitem{ellis1989}
+C. A. Ellis and S. J. Gibbs, ``Concurrency control in groupware systems,'' in \emph{Proc. ACM SIGMOD Int. Conf. on Management of Data}, Portland, OR, USA, 1989, pp. 399--407.
+
+\bibitem{sun1998}
+C. Sun and C. Ellis, ``Operational transformation in real-time group editors: issues, algorithms, and achievements,'' in \emph{Proc. ACM Conf. on Computer Supported Cooperative Work (CSCW)}, Seattle, WA, USA, 1998, pp. 59--68.
+
+\bibitem{jupiter1995}
+D. A. Nichols, P. Curtis, M. Dixon, and J. Lamping, ``High-latency, low-bandwidth windowing in the Jupiter collaboration system,'' in \emph{Proc. 8th ACM Symp. on User Interface Software and Technology (UIST)}, Pittsburgh, PA, USA, 1995, pp. 109--117.
+
+\bibitem{shapiro2011}
+M. Shapiro, N. Pregui{\c{c}}a, C. Baquero, and M. Zawirski, ``Conflict-free replicated data types,'' in \emph{Proc. 13th Int. Symp. on Stabilization, Safety, and Security of Distributed Systems (SSS)}, Grenoble, France, 2011, pp. 386--400.
+
+\bibitem{shapiro2011b}
+M. Shapiro, N. Pregui{\c{c}}a, C. Baquero, and M. Zawirski, ``Conflict-free replicated data types,'' \emph{INRIA Research Report} 7687, July 2011.
+
+\bibitem{weiss2009}
+S. Weiss, P. Urso, and P. Molli, ``Logoot: A scalable optimistic replication algorithm for collaborative editing on P2P networks,'' in \emph{Proc. 29th IEEE Int. Conf. on Distributed Computing Systems (ICDCS)}, Montreal, Canada, 2009, pp. 404--412.
+
+\bibitem{spiewak2010}
+D. Spiewak, ``Understanding and applying operational transformation,'' \emph{CodeCommit}, May 2010. [Online]. Available: \url{http://codecommit.com/blog/java/understanding-and-applying-operational-transformation/}
+
+\bibitem{kleppmann2017}
+M. Kleppmann, \emph{Designing Data-Intensive Applications}. Sebastopol, CA, USA: O'Reilly Media, 2017.
+
+\bibitem{prosemirror}
+M. Haverbeke, ``ProseMirror: A toolkit for building rich-text editors,'' [Online]. Available: \url{https://prosemirror.net/}
+
+\bibitem{tiptap}
+Tiptap, ``Tiptap: The headless editor framework for web artisans,'' [Online]. Available: \url{https://tiptap.dev/}
+
+\end{thebibliography}
+
+\end{document}

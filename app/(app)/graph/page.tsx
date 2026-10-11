@@ -6,6 +6,7 @@ import { getOrCreateUser } from "@/lib/user";
 import GraphExplorer, {
   type GraphExplorerData,
 } from "@/components/graph/graph-explorer";
+import GraphLive from "@/components/graph/graph-live";
 
 export const dynamic = "force-dynamic";
 
@@ -84,6 +85,7 @@ export default async function GraphPage() {
 
   return (
     <div className="mx-auto w-full max-w-6xl px-4 py-8 sm:px-6">
+      <GraphLive />
       <div className="mb-6">
         <h1 className="text-xl font-semibold tracking-tight text-foreground">
           Knowledge graph

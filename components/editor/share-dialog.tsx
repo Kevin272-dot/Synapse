@@ -16,6 +16,7 @@ import {
   shareDocument,
   revokeShare,
   setDocumentVisibility,
+  setSyncEngine,
 } from "@/lib/actions";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 
@@ -31,11 +32,13 @@ export function ShareDialog({
   isOwner,
   collaborators,
   visibility,
+  syncEngine,
 }: {
   docId: string;
   isOwner: boolean;
   collaborators: Collaborator[];
   visibility: "private" | "public";
+  syncEngine: "ot" | "crdt";
 }) {
   const [open, setOpen] = useState(false);
   const [email, setEmail] = useState("");
@@ -110,6 +113,21 @@ export function ShareDialog({
       // Restricting is safe; no confirmation needed.
       changeVisibility("private");
     }
+  }
+
+  function changeEngine(next: "ot" | "crdt") {
+    if (next === syncEngine || !isOwner) return;
+    setError(null);
+    startTransition(async () => {
+      try {
+        await setSyncEngine(docId, next);
+        // The mode change reinitializes the sync state — reload so the
+        // client re-joins with the new engine.
+        window.location.reload();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Could not switch engine");
+      }
+    });
   }
 
   return (
@@ -268,6 +286,36 @@ export function ShareDialog({
               {!isOwner && (
                 <p className="mt-2 text-xs text-slate-400">
                   Only the document owner can change general access.
+                </p>
+              )}
+            </div>
+
+            {/* Sync engine */}
+            <div className="mt-5">
+              <h3 className="text-xs font-medium uppercase tracking-wide text-slate-400">
+                Sync engine
+              </h3>
+              <div className="mt-2 space-y-1">
+                <AccessOption
+                  icon={<span className="text-xs font-bold">OT</span>}
+                  title="Operational Transform"
+                  description="Server-authoritative: ops are sequenced and transformed centrally. Exact cursor positioning."
+                  active={syncEngine === "ot"}
+                  disabled={!isOwner || isPending}
+                  onClick={() => changeEngine("ot")}
+                />
+                <AccessOption
+                  icon={<span className="text-xs font-bold">CRDT</span>}
+                  title="CRDT (Logoot)"
+                  description="Decentralized: commutative character IDs, the server just relays. Tolerates message reordering."
+                  active={syncEngine === "crdt"}
+                  disabled={!isOwner || isPending}
+                  onClick={() => changeEngine("crdt")}
+                />
+              </div>
+              {!isOwner && (
+                <p className="mt-2 text-xs text-slate-400">
+                  Only the document owner can change the sync engine.
                 </p>
               )}
             </div>

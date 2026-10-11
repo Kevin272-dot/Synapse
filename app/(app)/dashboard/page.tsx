@@ -112,6 +112,13 @@ export default async function DashboardPage({
               ? { title: { contains: query, mode: "insensitive" } }
               : {}),
           },
+          include: {
+            concepts: {
+              orderBy: { count: "desc" },
+              take: 3,
+              select: { concept: { select: { name: true } } },
+            },
+          },
           orderBy: { updatedAt: "desc" },
           take: 100,
         }),
@@ -357,6 +364,7 @@ export default async function DashboardPage({
                       title: doc.title,
                       updatedAt: formatDate(doc.updatedAt),
                     }}
+                    tags={doc.concepts?.map((dc) => dc.concept.name)}
                   />
                 ))}
               </div>

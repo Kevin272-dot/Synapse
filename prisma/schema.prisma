@@ -45,6 +45,9 @@ model Document {
   text      String   @default("")
   // Access mode: "private" (owner + shares) | "public" (any signed-in user can view).
   visibility String  @default("private")
+  // Sync engine for this document: "ot" (server-authoritative transform)
+  // or "crdt" (decentralized Logoot merge, relayed by the server).
+  syncEngine String  @default("ot")
   // Text at version 0 (before the first logged op) — enables replay-based
   // reconstruction of any version from the operation log.
   logBaseText String? @db.Text
@@ -64,6 +67,8 @@ model Document {
   concepts    DocumentConcept[]
   shares      DocumentShare[]
   operations  DocumentOperation[]
+  // Semantic search embedding (Gemini text-embedding-004, 768 dims, stored as JSON)
+  embedding   Json?
 }
 
 /// One durably-logged OT operation. version V holds the op that moved the

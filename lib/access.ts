@@ -13,6 +13,7 @@ export interface DocAccess {
     flashcards: unknown;
     quiz: unknown;
     visibility: DocVisibility;
+    syncEngine: "ot" | "crdt";
     ownerId: string;
   };
   role: DocRole;
@@ -40,6 +41,7 @@ export async function getDocumentAccess(
       flashcards: true,
       quiz: true,
       visibility: true,
+      syncEngine: true,
       ownerId: true,
     },
   });
@@ -47,9 +49,11 @@ export async function getDocumentAccess(
 
   const visibility: DocVisibility =
     doc.visibility === "public" ? "public" : "private";
+  const syncEngine: "ot" | "crdt" =
+    doc.syncEngine === "crdt" ? "crdt" : "ot";
 
   if (doc.ownerId === internalUserId) {
-    return { doc: { ...doc, visibility }, role: "owner" };
+    return { doc: { ...doc, visibility, syncEngine }, role: "owner" };
   }
 
   const share = await prisma.documentShare.findUnique({
@@ -60,14 +64,14 @@ export async function getDocumentAccess(
   });
   if (share) {
     return {
-      doc: { ...doc, visibility },
+      doc: { ...doc, visibility, syncEngine },
       role: share.role === "viewer" ? "viewer" : "editor",
     };
   }
 
   // Public docs: any signed-in user can view.
   if (visibility === "public") {
-    return { doc: { ...doc, visibility }, role: "viewer" };
+    return { doc: { ...doc, visibility, syncEngine }, role: "viewer" };
   }
 
   return null;

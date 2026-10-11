@@ -92,6 +92,34 @@ export async function generateQuiz(docId: string, regenerate = false) {
 
 /* -------------------------- Concept extraction ------------------------- */
 
+/* -------------------------- Concept extraction ------------------------- */
+
+/** Inline AI: continue writing from the text before the cursor. */
+export async function continueWriting(docId: string, textBeforeCursor: string) {
+  await requireEditableDoc(docId);
+
+  const result = await generateJSON<{ continuation: string }>(
+    '{ "continuation": "string — 1-3 sentences that naturally continue the text" }',
+    truncateForAI(textBeforeCursor.slice(-3000)),
+    "Continue writing this document. Write 1-3 sentences that flow naturally from where the text leaves off. Do not repeat existing content."
+  );
+
+  return result.continuation;
+}
+
+/** Inline AI: explain the selected text in simpler terms. */
+export async function explainSelection(docId: string, selection: string) {
+  await requireEditableDoc(docId);
+
+  const result = await generateJSON<{ explanation: string }>(
+    '{ "explanation": "string — a clear 2-3 sentence explanation" }',
+    truncateForAI(selection),
+    "Explain this text passage in simple, clear terms."
+  );
+
+  return result.explanation;
+}
+
 export async function extractConcepts(docId: string, regenerate = false) {
   const { user, doc } = await requireEditableDoc(docId);
 

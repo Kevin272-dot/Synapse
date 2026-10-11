@@ -14,6 +14,9 @@ A real-time collaborative document editor (Google-Docs-like), built as a persona
 - AI features via **Groq** — `@ai-sdk/groq`, key `GROQ_API_KEY` (models like `llama-3.3-70b-versatile`), with **Google Gemini** (`@ai-sdk/google`, `GOOGLE_GENERATIVE_AI_API_KEY`) as automatic fallback
 - Plain-text OT engine in `lib/ot/` (op types, apply, transform); Vitest property tests prove convergence
 - Every applied OT op is durably logged (`DocumentOperation` table: doc + version + op + author) — the foundation for version history, the audit feed, and offline replay. Server cold-starts by replaying the log tail. `Document.logBaseText` snapshots the version-0 text so any version is reconstructible by replay (logBaseText ⊕ ops 1..K). Restore is expressed as an ordinary OT op diffed client-side.
+- Logoot CRDT engine in `lib/crdt/logoot.ts` — selectable per document (`Document.syncEngine`), server relays without transformation. Property tests prove convergence for 2-3 sites.
+- Live KG pipeline: quiescence-triggered (4s) after last op, incremental LLM extraction, concepts upserted and visible on the graph page in real time.
+- Inline AI slash menu: "/" in the editor triggers Continue writing (LLM), formatting shortcuts, and structural insertions.
 
 ## Deployment target: AWS
 

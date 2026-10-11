@@ -9,9 +9,12 @@ import EditorToolbar from "@/components/editor/toolbar";
 import EditorMenuBar from "@/components/editor/menu-bar";
 import AiPanel from "@/components/editor/ai-panel";
 import { ShareDialog } from "@/components/editor/share-dialog";
+import SlashMenu from "@/components/editor/slash-menu";
 import { saveDocument, renameDocument } from "@/lib/actions";
 import { useCollabSocket } from "@/lib/ot/use-collab-socket";
 import { docToText, diffToOp, applyRemoteOp, docPosToTextOffset, textOffsetToDocPos } from "@/lib/ot/editor-bridge";
+import { Logoot, type CrdtOp } from "@/lib/crdt/logoot";
+import type { Operation } from "@/lib/ot/engine";
 import { EDITOR_EXTENSIONS } from "@/lib/editor/extensions";
 import { RemoteCursors, remoteCursorsKey, cursorColor } from "@/lib/editor/remote-cursors";
 import "./editor.css";
@@ -28,6 +31,7 @@ type EditorProps = {
   editable?: boolean;
   isOwner?: boolean;
   visibility?: "private" | "public";
+  syncEngine?: "ot" | "crdt";
   collaborators?: {
     id: string;
     name: string;
@@ -53,6 +57,7 @@ export default function Editor({
   editable = true,
   isOwner = true,
   visibility = "private",
+  syncEngine = "ot",
   collaborators = [],
 }: EditorProps) {
   const { user, isLoaded } = useUser();
@@ -65,6 +70,7 @@ export default function Editor({
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved">(
     "idle"
   );
+  const [slashOpen, setSlashOpen] = useState(false);
 
   // Refs so the debounce/flush closures always see current values.
   const docIdRef = useRef(docId);
@@ -74,6 +80,10 @@ export default function Editor({
   const dirtyRef = useRef(false);
   const applyingRemoteRef = useRef(false);
   const lastTextRef = useRef<string>(initialText ?? "");
+  // Sync-engine state (OT is the default; CRDT mode uses a Logoot mirror).
+  const engineRef = useRef<"ot" | "crdt">("ot");
+  const crdtMirrorRef = useRef<Logoot | null>(null);
+  const pendingCrdtRef = useRef<CrdtOp[]>([]);
 
   function scheduleSave() {
     if (saveTimer.current) clearTimeout(saveTimer.current);
@@ -145,14 +155,18 @@ export default function Editor({
       dirtyRef.current = true;
       scheduleSave();
 
-      // Extract a plain-text OT op for LOCAL edits (not remote-applied ones).
+      // Extract a plain-text op for LOCAL edits (not remote-applied ones).
       if (!applyingRemoteRef.current) {
         const before = lastTextRef.current;
         const after = docToText(editor);
         const op = diffToOp(before, after);
         if (op.length > 0) {
           lastTextRef.current = after;
-          submitOp(op);
+          if (engineRef.current === "crdt" && crdtMirrorRef.current) {
+            submitCrdt(translateOpToCrdt(op, crdtMirrorRef.current));
+          } else {
+            submitOp(op);
+          }
         }
       }
     },
@@ -167,7 +181,7 @@ export default function Editor({
   });
 
   // Real-time collaboration socket.
-  const { connected, denied, peers, submitOp, updatePresence } = useCollabSocket({
+  const { connected, denied, engine, peers, submitOp, submitCrdt, updatePresence } = useCollabSocket({
     docId,
     userId: clerkId,
     name: displayName,
@@ -183,7 +197,35 @@ export default function Editor({
         applyingRemoteRef.current = false;
       }
     },
+    onRemoteCrdt: (ops) => {
+      if (!editor) return;
+      const mirror = crdtMirrorRef.current;
+      if (!mirror) return;
+      applyingRemoteRef.current = true;
+      try {
+        for (const crdtOp of ops) mirror.applyRemote(crdtOp);
+        const newText = mirror.toText();
+        const editorText = docToText(editor);
+        if (newText !== editorText) {
+          applyRemoteOp(editor, diffToOp(editorText, newText));
+        }
+        lastTextRef.current = newText;
+      } finally {
+        applyingRemoteRef.current = false;
+      }
+    },
   });
+
+  // Keep refs + CRDT mirror in sync with the engine the server reports.
+  useEffect(() => {
+    engineRef.current = engine;
+    if (engine === "crdt" && crdtMirrorRef.current === null) {
+      const mirror = new Logoot(clerkId || "client");
+      mirror.loadText(lastTextRef.current);
+      crdtMirrorRef.current = mirror;
+    }
+    if (engine === "ot") crdtMirrorRef.current = null;
+  }, [engine, clerkId, editor]);
 
   // Paint collaborators' carets/selection into the editor as decorations.
   useEffect(() => {
@@ -277,12 +319,25 @@ export default function Editor({
             </span>
           )}
 
+          {/* Sync engine badge */}
+          <span
+            className="hidden shrink-0 rounded-full bg-slate-900/5 px-2.5 py-0.5 text-xs font-medium text-slate-500 dark:bg-white/10 dark:text-slate-300 sm:inline-block"
+            title={
+              syncEngine === "crdt"
+                ? "CRDT: decentralized Logoot merge (server relays, no transformation)"
+                : "OT: server-authoritative operational transform"
+            }
+          >
+            {syncEngine === "crdt" ? "CRDT" : "OT"}
+          </span>
+
           {/* Share */}
           <ShareDialog
             docId={docId}
             isOwner={isOwner}
             collaborators={collaborators}
             visibility={visibility}
+            syncEngine={syncEngine}
           />
 
           {/* Save status */}
@@ -337,18 +392,28 @@ export default function Editor({
         </div>
       </main>
 
+      {/* ===== Slash menu ===== */}
+      {editable && editor && (
+        <SlashMenu editor={editor} docId={docId} onDismiss={() => setSlashOpen(false)} />
+      )}
+
       {/* ===== AI panel ===== */}
       <AiPanel
         docId={docId}
         editable={editable}
         onRestore={(targetText) => {
           if (!editor || !editable) return;
-          // Restore is just another OT op: diff current -> target and send
-          // it through the normal pipeline, so it syncs live and is logged.
+          // Restore is just another sync op: diff current -> target and send
+          // it through the active engine's pipeline, so it syncs live,
+          // converges, and is logged.
           const op = diffToOp(lastTextRef.current, targetText);
           if (op.length === 0) return;
           lastTextRef.current = targetText;
-          submitOp(op);
+          if (engineRef.current === "crdt" && crdtMirrorRef.current) {
+            submitCrdt(translateOpToCrdt(op, crdtMirrorRef.current));
+          } else {
+            submitOp(op);
+          }
           applyRemoteOp(editor, op);
         }}
         initialSummary={initialSummary ?? null}
@@ -357,6 +422,27 @@ export default function Editor({
       />
     </div>
   );
+}
+
+/**
+ * Translate a plain-text OT op into Logoot CRDT ops against the mirror,
+ * updating the mirror locally. The mirror's visible indexing matches the
+ * OT op's retain/delete coordinates.
+ */
+function translateOpToCrdt(op: Operation, mirror: Logoot): CrdtOp[] {
+  const out: CrdtOp[] = [];
+  let idx = 0;
+  for (const c of op) {
+    if ("retain" in c) {
+      idx += c.retain;
+    } else if ("delete" in c) {
+      out.push(...mirror.localDelete(idx, c.delete));
+    } else {
+      out.push(...mirror.localInsert(idx, c.insert));
+      idx += c.insert.length;
+    }
+  }
+  return out;
 }
 
 /** Initials from a display name ("Kevin Daniel" -> "KD"). */

@@ -8,6 +8,7 @@ import { getOrCreateUser } from "@/lib/user";
 import { getDocumentAccess, canEdit } from "@/lib/access";
 import { fromJSON, apply } from "@/lib/ot/engine";
 import { summarizeOperation } from "@/lib/ot/op-summary";
+import { cosineSimilarity } from "@/lib/embeddings";
 
 async function requireUser() {
   const { userId } = await auth();
@@ -268,6 +269,35 @@ export async function setDocumentVisibility(
   revalidatePath(`/doc/${docId}`);
 }
 
+/** Switch the document's sync engine: "ot" (server-authoritative transform)
+ *  or "crdt" (decentralized Logoot merge). Owner only. */
+export async function setSyncEngine(
+  docId: string,
+  engine: "ot" | "crdt"
+) {
+  const user = await requireUser();
+
+  const doc = await prisma.document.findFirst({
+    where: { id: docId, ownerId: user.id },
+    select: { id: true },
+  });
+  if (!doc) throw new Error("Only the owner can change the sync engine");
+
+  await prisma.document.update({
+    where: { id: docId },
+    data: { syncEngine: engine === "crdt" ? "crdt" : "ot" },
+  });
+
+  // Drop the in-memory cached state so the next join re-initializes with
+  // the correct engine (server.ts exposes the registry via globalThis).
+  const store = globalThis as unknown as {
+    __synapseResetEngine?: (docId: string) => void;
+  };
+  store.__synapseResetEngine?.(docId);
+
+  revalidatePath(`/doc/${docId}`);
+}
+
 /* ---------------------------- Activity feed ------------------------------ */
 
 export interface ActivityEntry {
@@ -350,4 +380,72 @@ export async function getVersionText(docId: string, version: number) {
     }
   }
   return { text, version };
+}
+
+/* ---------------------------- Semantic search ----------------------------- */
+
+export interface SemanticSearchResult {
+  id: string;
+  title: string;
+  score: number;
+  snippet: string;
+}
+
+/** Semantic search across all accessible documents using Gemini embeddings. */
+export async function semanticSearchDocs(
+  query: string,
+  limit = 10
+): Promise<SemanticSearchResult[]> {
+  const user = await requireUser();
+  if (!query.trim()) return [];
+
+  const { generateEmbedding, cosineSimilarity } = await import(
+    "@/lib/embeddings"
+  );
+  const { embed } = await import("ai");
+  const { createGoogleGenerativeAI } = await import("@ai-sdk/google");
+
+  const googleClient = createGoogleGenerativeAI({
+    apiKey: process.env.GOOGLE_GENERATIVE_AI_API_KEY ?? "",
+  });
+
+  // Embed the query.
+  const { embedding: queryVec } = await embed({
+    model: googleClient.textEmbeddingModel("text-embedding-004"),
+    value: query.trim(),
+  });
+
+  // Find all accessible docs that have embeddings.
+  const docs = await prisma.document.findMany({
+    where: {
+      OR: [{ ownerId: user.id }, { shares: { some: { userId: user.id } } }],
+    },
+    select: {
+      id: true,
+      title: true,
+      embedding: true,
+      text: true,
+    },
+    take: 200,
+  });
+
+  const results = docs
+    .map((doc) => {
+      const emb = doc.embedding as unknown as number[];
+      if (!Array.isArray(emb) || emb.length === 0) return null;
+      const score = cosineSimilarity(queryVec, emb);
+      // Derive a snippet from the doc text.
+      const snippet = doc.text.slice(0, 120);
+      return {
+        id: doc.id,
+        title: doc.title,
+        score,
+        snippet,
+      };
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return results;
 }

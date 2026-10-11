@@ -4,6 +4,7 @@ import { currentUser } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/prisma";
 import { getOrCreateUser } from "@/lib/user";
 import { getDocumentAccess, canEdit } from "@/lib/access";
+// (syncEngine is selected inside lib/access)
 import Editor from "@/components/editor/editor";
 
 export const dynamic = "force-dynamic";
@@ -80,6 +81,7 @@ export default async function DocPage({
         initialFlashcards={doc.flashcards}
         initialQuiz={doc.quiz}
         visibility={access.doc.visibility}
+        syncEngine={access.doc.syncEngine}
         role={role}
         editable={editable}
         isOwner={role === "owner"}

@@ -21,6 +21,10 @@ export const EVENTS = {
   LEAVE: "doc:leave",
   /** server -> client: this socket is not allowed to access the document */
   ERROR: "doc:error",
+  /** client -> server: submit Logoot CRDT ops (crdt-engine docs) */
+  CRDT_OPS: "doc:crdt-ops",
+  /** server -> client: relayed CRDT ops from any collaborator */
+  CRDT_APPLIED: "doc:crdt-applied",
 } as const;
 
 export interface JoinPayload {
@@ -33,6 +37,8 @@ export interface SyncPayload {
   docId: string;
   text: string;
   version: number;
+  /** Which sync engine this document uses. */
+  engine: "ot" | "crdt";
   /** Current presence snapshot so a joiner sees who's here. */
   presence: PresenceEntry[];
 }

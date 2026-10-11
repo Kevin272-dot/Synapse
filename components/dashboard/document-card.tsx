@@ -10,10 +10,12 @@ import { PagePreview } from "@/components/dashboard/page-preview";
 export function DocumentCard({
   doc,
   ownerName,
+  tags,
   canDelete = true,
 }: {
   doc: { id: string; title: string; updatedAt: string };
   ownerName?: string;
+  tags?: string[];
   canDelete?: boolean;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -84,6 +86,18 @@ export function DocumentCard({
             {ownerName ? `${ownerName} · ` : ""}
             {doc.updatedAt}
           </p>
+          {tags && tags.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-1">
+              {tags.map((t) => (
+                <span
+                  key={t}
+                  className="rounded-full bg-[#e8f0fe] px-1.5 py-0.5 text-[10px] font-medium text-[#1967d2] dark:bg-[#1a73e8]/20 dark:text-[#a8c7fa]"
+                >
+                  {t}
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
