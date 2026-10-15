@@ -106,6 +106,7 @@ model DocumentShare {
 model Concept {
   id        String   @id @default(cuid())
   name      String
+  type      String   @default("Concept")
   owner     User     @relation(fields: [ownerId], references: [id])
   ownerId   String
 
@@ -138,6 +139,7 @@ model ConceptEdge {
   fromId   String
   to       Concept @relation("ConceptEdgeTo", fields: [toId], references: [id], onDelete: Cascade)
   toId     String
+  relation String  @default("relates to")
   strength Int     @default(1)
 
   @@unique([fromId, toId])

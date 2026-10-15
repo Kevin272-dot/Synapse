@@ -92,8 +92,6 @@ export async function generateQuiz(docId: string, regenerate = false) {
 
 /* -------------------------- Concept extraction ------------------------- */
 
-/* -------------------------- Concept extraction ------------------------- */
-
 /** Inline AI: continue writing from the text before the cursor. */
 export async function continueWriting(docId: string, textBeforeCursor: string) {
   await requireEditableDoc(docId);
@@ -130,44 +128,79 @@ export async function extractConcepts(docId: string, regenerate = false) {
   if (existing > 0 && !regenerate) return { extracted: false };
 
   const result = await generateJSON<{
-    concepts: { name: string; count?: number }[];
+    nodes: { id: string; label: string; type: string }[];
+    edges: { source: string; target: string; relation: string }[];
   }>(
-    '{ "concepts": [{ "name": "string", "count": 1 }] }',
+    JSON.stringify({
+      nodes: [{ id: "unique_string_id", label: "Entity Name", type: "Concept|Project|Person|Document|Methodology" }],
+      edges: [{ source: "node_id_1", target: "node_id_2", relation: "short_verb_phrase" }],
+    }),
     truncateForAI(doc.text),
-    "Extract the 3 to 8 most important topics/concepts of this document. " +
-      "Use short lowercase names (1-3 words). count = how many times the topic appears."
+    "Extract key entities (concepts, technologies, people, projects, methodologies) " +
+      "and their directed relationships from this document. " +
+      "Keep entity labels concise (1-4 words). " +
+      "Relations must be action-oriented verbs (1-3 words, e.g. 'depends on', 'uses', 'authored by'). " +
+      "Standardize names (e.g. merge 'ReactJS' and 'React' into 'React'). " +
+      "Limit to 8 nodes and 12 edges maximum."
   );
 
-  // Keep only the strongest 8 topics per document — the graph connects
-  // DOCUMENTS through shared topics, so a small high-precision set per doc
-  // is what keeps the map readable.
-  const concepts = (result.concepts ?? [])
-    .map((c) => ({ name: c.name.trim(), count: c.count ?? 1 }))
-    .filter((c) => c.name.length > 0 && c.name.length <= 40)
-    .sort((a, b) => b.count - a.count)
+  // Cap and sanitize.
+  const nodes = (result.nodes ?? [])
+    .map((n) => ({ id: n.id?.trim(), label: n.label?.trim(), type: n.type?.trim() || "Concept" }))
+    .filter((n) => n.id && n.label && n.label.length <= 40)
     .slice(0, 8);
 
-  // Upsert concepts and their links to this doc.
+  const idSet = new Set(nodes.map((n) => n.id));
+  const edges = (result.edges ?? [])
+    .map((e) => ({ source: e.source?.trim(), target: e.target?.trim(), relation: e.relation?.trim() || "relates to" }))
+    .filter((e) => e.source && e.target && e.source !== e.target && idSet.has(e.source) && idSet.has(e.target) && e.relation.length <= 30)
+    .slice(0, 12);
+
+  if (nodes.length === 0) return { extracted: false };
+
+  // Upsert concepts (with type), doc links, and typed edges.
   await prisma.$transaction(async (tx) => {
-    for (const c of concepts) {
+    for (const n of nodes) {
       let concept = await tx.concept.findUnique({
-        where: { ownerId_name: { ownerId: user.id, name: c.name } },
+        where: { ownerId_name: { ownerId: user.id, name: n.label } },
       });
       if (!concept) {
         concept = await tx.concept.create({
-          data: { name: c.name, ownerId: user.id },
+          data: { name: n.label, type: n.type, ownerId: user.id },
         });
+      } else if (concept.type !== n.type) {
+        await tx.concept.update({ where: { id: concept.id }, data: { type: n.type } });
       }
       await tx.documentConcept.upsert({
         where: {
           documentId_conceptId: { documentId: docId, conceptId: concept.id },
         },
+        create: { documentId: docId, conceptId: concept.id, count: 1 },
+        update: {},
+      });
+    }
+
+    for (const e of edges) {
+      const fromNode = nodes.find((n) => n.id === e.source);
+      const toNode = nodes.find((n) => n.id === e.target);
+      if (!fromNode || !toNode) continue;
+      const fromConcept = await tx.concept.findUnique({
+        where: { ownerId_name: { ownerId: user.id, name: fromNode.label } },
+      });
+      const toConcept = await tx.concept.findUnique({
+        where: { ownerId_name: { ownerId: user.id, name: toNode.label } },
+      });
+      if (!fromConcept || !toConcept) continue;
+      await tx.conceptEdge.upsert({
+        where: { fromId_toId: { fromId: fromConcept.id, toId: toConcept.id } },
         create: {
-          documentId: docId,
-          conceptId: concept.id,
-          count: c.count,
+          fromId: fromConcept.id,
+          toId: toConcept.id,
+          ownerId: user.id,
+          relation: e.relation,
+          strength: 1,
         },
-        update: { count: c.count },
+        update: { relation: e.relation, strength: { increment: 1 } },
       });
     }
   });

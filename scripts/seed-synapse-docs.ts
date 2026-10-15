@@ -40,22 +40,22 @@ function buildDoc(blocks: Array<
   return { type: "doc", content: children };
 }
 
-function text(blocks: Array<{ p?: string } | { bullet?: string[] } | { h1?: string } | { h2?: string } | { h3?: string } | { quote?: string } | { numbered?: string[] }>): string {
-  return blocks.map((b) => {
-    if ("p" in b) return b.p;
-    if ("h1" in b) return "# " + b.h1;
-    if ("h2" in b) return "## " + b.h2;
-    if ("h3" in b) return "### " + b.h3;
-    if ("quote" in b) return "> " + b.quote;
-    if ("bullet" in b) return b.bullet.map((t) => "- " + t).join("\n");
-    if ("numbered" in b) return b.numbered.map((t, i) => `${i + 1}. ${t}`).join("\n");
+function text(blocks: Array<Record<string, unknown>>): string {
+  return blocks.map((b: Record<string, unknown>) => {
+    if (typeof b.p === "string") return b.p;
+    if (typeof b.h1 === "string") return "# " + b.h1;
+    if (typeof b.h2 === "string") return "## " + b.h2;
+    if (typeof b.h3 === "string") return "### " + b.h3;
+    if (typeof b.quote === "string") return "> " + b.quote;
+    if (Array.isArray(b.bullet)) return (b.bullet as string[]).map((t: string) => "- " + t).join("\n");
+    if (Array.isArray(b.numbered)) return (b.numbered as string[]).map((t: string, i: number) => `${i + 1}. ${t}`).join("\n");
     return "";
   }).join("\n\n");
 }
 
 interface DocSeed {
   title: string;
-  blocks: Parameters<typeof doc>[0];
+  blocks: Parameters<typeof buildDoc>[0];
 }
 
 const DOCS: DocSeed[] = [
