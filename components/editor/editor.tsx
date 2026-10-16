@@ -382,11 +382,10 @@ export default function Editor({
         </div>
       )}
 
-      {/* ===== Gray canvas + white page ===== */}
+      {/* ===== The "page" ===== */}
       <main className="flex-1 overflow-x-auto">
         <div className="mx-auto my-8 w-full max-w-4xl px-4 sm:my-12 sm:px-8">
-          {/* The "page" */}
-          <div className="min-h-[90vh] rounded-sm bg-white px-8 py-12 shadow-[0_1px_3px_rgba(0,0,0,0.15),0_8px_24px_rgba(0,0,0,0.12)] sm:px-16 sm:py-16 dark:bg-white">
+          <div className="min-h-[90vh] rounded-md bg-white shadow-[0_1px_3px_rgba(60,64,67,0.15),0_8px_28px_rgba(60,64,67,0.12)] transition-shadow duration-200 sm:px-16 sm:py-16 dark:bg-white">
             <EditorContent editor={editor} />
           </div>
         </div>

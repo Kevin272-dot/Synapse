@@ -13,6 +13,7 @@ import { FolderRowActions } from "@/components/folder-row-actions";
 import { ImportDocumentButton } from "@/components/import-document-button";
 import { NewFolderButton } from "@/components/new-folder-button";
 import { createDocument } from "@/lib/actions";
+import { semanticSearchDocs } from "@/lib/actions";
 import { PagePreview } from "@/components/dashboard/page-preview";
 import { DocumentCard } from "@/components/dashboard/document-card";
 import { ViewToggle } from "@/components/dashboard/view-toggle";
@@ -146,6 +147,13 @@ export default async function DashboardPage({
   const showFolders = !sharedOnly && folders.length > 0;
   const showOwned = !sharedOnly && documents.length > 0;
   const showShared = sharedDocuments.length > 0 && (sharedOnly || isRoot);
+
+  // Semantic fallback: when a search has no title matches, find docs by
+  // meaning (Gemini embeddings + cosine similarity).
+  const semanticResults =
+    query && !showOwned && !sharedOnly
+      ? await semanticSearchDocs(query, 6)
+      : [];
 
   return (
     <>
@@ -350,8 +358,13 @@ export default async function DashboardPage({
               isRoot && !query ? null : (
                 <div className="rounded-xl border border-dashed border-[#dadce0] py-14 text-center dark:border-white/10">
                   <p className="text-sm font-medium text-slate-600 dark:text-slate-300">
-                    {query ? `No documents match “${query}”` : "Nothing here yet"}
+                    No title matches for “{query}”
                   </p>
+                  {semanticResults.length === 0 && (
+                    <p className="mt-1 text-sm text-slate-400 dark:text-slate-500">
+                      Semantic search found nothing either.
+                    </p>
+                  )}
                 </div>
               )
             ) : view === "grid" && showOwned ? (
@@ -411,6 +424,48 @@ export default async function DashboardPage({
                 </table>
               </div>
             ) : null}
+          </section>
+        )}
+
+        {/* ===== Semantic matches (fallback when title search is empty) ===== */}
+        {query && semanticResults.length > 0 && (
+          <section className="mt-6">
+            <h2 className="mb-3 text-base font-medium text-[#202124] dark:text-slate-100">
+              Semantic matches
+            </h2>
+            <p className="mb-3 text-xs text-[#5f6368] dark:text-slate-400">
+              Found by meaning (Gemini embeddings), not by title keywords.
+            </p>
+            <div className="overflow-hidden rounded-lg border border-[#dadce0] dark:border-white/10">
+              <ul className="divide-y divide-[#dadce0]/60 dark:divide-white/5">
+                {semanticResults.map((r) => (
+                  <li
+                    key={r.id}
+                    className="flex items-center gap-3 px-4 py-2.5 transition hover:bg-[#f8f9fa] dark:hover:bg-white/[0.02]"
+                  >
+                    <Link
+                      href={`/doc/${r.id}`}
+                      className="group flex min-w-0 flex-1 items-center gap-3 text-foreground"
+                    >
+                      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#e8f0fe] text-[#1967d2] dark:bg-[#1a73e8]/20 dark:text-[#a8c7fa]">
+                        <FileText className="h-4 w-4" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block truncate font-medium text-[#202124] dark:text-slate-100">
+                          {r.title}
+                        </span>
+                        <span className="block truncate text-xs text-[#5f6368] dark:text-slate-400">
+                          {r.snippet}…
+                        </span>
+                      </span>
+                    </Link>
+                    <span className="shrink-0 rounded-full bg-[#e8f0fe] px-2 py-0.5 text-[11px] font-medium text-[#1967d2] dark:bg-[#1a73e8]/20 dark:text-[#a8c7fa]">
+                      {Math.round(r.score * 100)}% match
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
           </section>
         )}
 
