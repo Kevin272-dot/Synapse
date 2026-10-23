@@ -4,6 +4,7 @@ import {
   FileText,
   Folder,
   Home,
+  ListChecks,
 } from "lucide-react";
 import { currentUser } from "@clerk/nextjs/server";
 import { prisma } from "@/lib/prisma";
@@ -11,9 +12,11 @@ import { getOrCreateUser } from "@/lib/user";
 import { DeleteDocumentButton } from "@/components/delete-document-button";
 import { FolderRowActions } from "@/components/folder-row-actions";
 import { ImportDocumentButton } from "@/components/import-document-button";
+import { NewDocumentButton } from "@/components/new-document-button";
 import { NewFolderButton } from "@/components/new-folder-button";
-import { createDocument } from "@/lib/actions";
+import { createDocument, createDocumentFromTemplate } from "@/lib/actions";
 import { semanticSearchDocs } from "@/lib/actions";
+import { NOTE_TEMPLATES } from "@/lib/templates";
 import { PagePreview } from "@/components/dashboard/page-preview";
 import { DocumentCard } from "@/components/dashboard/document-card";
 import { ViewToggle } from "@/components/dashboard/view-toggle";
@@ -32,12 +35,6 @@ function formatDate(date: Date) {
     year: "numeric",
   }).format(date);
 }
-
-const TEMPLATES = [
-  { name: "Meeting notes", accent: "#1a73e8" },
-  { name: "Brainstorm", accent: "#e8710a" },
-  { name: "Study guide", accent: "#188038" },
-];
 
 export default async function DashboardPage({
   searchParams,
@@ -148,12 +145,11 @@ export default async function DashboardPage({
   const showOwned = !sharedOnly && documents.length > 0;
   const showShared = sharedDocuments.length > 0 && (sharedOnly || isRoot);
 
-  // Semantic fallback: when a search has no title matches, find docs by
-  // meaning (Gemini embeddings + cosine similarity).
-  const semanticResults =
-    query && !showOwned && !sharedOnly
-      ? await semanticSearchDocs(query, 6)
-      : [];
+  // Semantic fallback: when a search has no title matches (across owned or
+  // shared scopes), find docs by meaning (Gemini embeddings + cosine).
+  const semanticResults = query && !showOwned
+    ? await semanticSearchDocs(query, 6)
+    : [];
 
   return (
     <>
@@ -193,19 +189,25 @@ export default async function DashboardPage({
                 </button>
               </form>
 
-              {TEMPLATES.map((t) => (
-                <div
-                  key={t.name}
-                  className="group flex w-full flex-col items-start gap-2"
+              {NOTE_TEMPLATES.map((t) => (
+                <form
+                  key={t.id}
+                  action={createDocumentFromTemplate.bind(null, t.id, null)}
                 >
-                  <PagePreview
-                    accent={t.accent}
-                    className="aspect-[3/4] transition group-hover:shadow-md"
-                  />
-                  <span className="text-sm font-medium text-[#3c4043] dark:text-slate-200">
-                    {t.name}
-                  </span>
-                </div>
+                  <button
+                    type="submit"
+                    title={t.description}
+                    className="group flex w-full flex-col items-start gap-2 text-left"
+                  >
+                    <PagePreview
+                      accent={t.accent}
+                      className="aspect-[3/4] transition group-hover:shadow-md"
+                    />
+                    <span className="text-sm font-medium text-[#3c4043] dark:text-slate-200">
+                      {t.name}
+                    </span>
+                  </button>
+                </form>
               ))}
             </div>
           </div>
@@ -262,8 +264,16 @@ export default async function DashboardPage({
               </p>
             </div>
             <div className="flex items-center gap-2">
+              <NewDocumentButton folderId={currentFolder?.id ?? null} compact />
               <ImportDocumentButton folderId={currentFolder?.id ?? null} compact />
               <NewFolderButton parentId={currentFolder?.id ?? null} compact />
+              <Link
+                href={`/quiz?folder=${currentFolder?.id ?? ""}`}
+                className="inline-flex h-9 items-center gap-2 rounded-full border border-slate-900/15 px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-900/5 dark:border-white/15 dark:text-slate-200 dark:hover:bg-white/5"
+              >
+                <ListChecks className="h-4 w-4" />
+                <span className="hidden sm:inline">Quiz folder</span>
+              </Link>
             </div>
           </div>
         )}

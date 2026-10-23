@@ -1,6 +1,6 @@
 import { prisma } from "@/lib/prisma";
 
-export type DocRole = "owner" | "editor" | "viewer";
+export type DocRole = "owner" | "editor" | "commenter" | "viewer";
 export type DocVisibility = "private" | "public";
 
 export interface DocAccess {
@@ -14,6 +14,8 @@ export interface DocAccess {
     quiz: unknown;
     visibility: DocVisibility;
     syncEngine: "ot" | "crdt";
+    kgEnabled: boolean;
+    folderId: string | null;
     ownerId: string;
   };
   role: DocRole;
@@ -42,6 +44,8 @@ export async function getDocumentAccess(
       quiz: true,
       visibility: true,
       syncEngine: true,
+      kgEnabled: true,
+      folderId: true,
       ownerId: true,
     },
   });
@@ -65,7 +69,11 @@ export async function getDocumentAccess(
   if (share) {
     return {
       doc: { ...doc, visibility, syncEngine },
-      role: share.role === "viewer" ? "viewer" : "editor",
+      role: (["owner", "editor", "commenter", "viewer"] as const).includes(
+        share.role as DocRole
+      )
+        ? (share.role as DocRole)
+        : "viewer",
     };
   }
 
@@ -77,7 +85,12 @@ export async function getDocumentAccess(
   return null;
 }
 
-/** True when the role may modify the document. */
+/** True when the role may modify the document text directly. */
 export function canEdit(role: DocRole): boolean {
   return role === "owner" || role === "editor";
+}
+
+/** True when the role may propose changes (suggestion mode). */
+export function canSuggest(role: DocRole): boolean {
+  return role !== "viewer";
 }

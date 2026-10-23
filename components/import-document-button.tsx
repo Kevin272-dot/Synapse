@@ -5,6 +5,7 @@ import { Upload, Loader2 } from "lucide-react";
 import { generateJSON } from "@tiptap/core";
 import DOMPurify from "dompurify";
 import * as mammoth from "mammoth";
+import { unzipSync } from "fflate";
 import { createDocumentFromImport } from "@/lib/actions";
 import { EDITOR_EXTENSIONS } from "@/lib/editor/extensions";
 
@@ -27,13 +28,24 @@ export function ImportDocumentButton({
   async function handleFile(file: File) {
     setError(null);
     try {
-      const title = file.name.replace(/\.(docx|html?|txt)$/i, "");
+      const lower = file.name.toLowerCase();
+      const sourceType: "docx" | "html" | "txt" | "pptx" = lower.endsWith(".pptx")
+        ? "pptx"
+        : lower.endsWith(".docx")
+          ? "docx"
+          : lower.endsWith(".html") || lower.endsWith(".htm")
+            ? "html"
+            : "txt";
+      const title = file.name.replace(/\.(docx|html?|txt|pptx)$/i, "");
       let html: string;
 
-      if (file.name.toLowerCase().endsWith(".docx")) {
+      if (sourceType === "docx") {
         const result = await mammoth.convertToHtml({ arrayBuffer: await file.arrayBuffer() });
         html = result.value;
-      } else if (file.name.toLowerCase().endsWith(".html") || file.name.toLowerCase().endsWith(".htm")) {
+      } else if (sourceType === "pptx") {
+        // Slides are extracted client-side: the .pptx is a zip of XML slides.
+        html = pptxToHtml(await file.arrayBuffer());
+      } else if (sourceType === "html") {
         html = await file.text();
       } else {
         // .txt -> wrap in <p>
@@ -61,6 +73,7 @@ export function ImportDocumentButton({
           content: JSON.stringify(json),
           text,
           folderId: folderId ?? null,
+          sourceType,
         });
       });
     } catch (e) {
@@ -73,7 +86,7 @@ export function ImportDocumentButton({
       <input
         ref={inputRef}
         type="file"
-        accept=".docx,.html,.htm,.txt"
+        accept=".docx,.html,.htm,.txt,.pptx"
         className="hidden"
         onChange={(e) => {
           const f = e.target.files?.[0];
@@ -126,4 +139,49 @@ function escapeHtml(s: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/**
+ * Extract slide text from a .pptx. A presentation is a zip of XML slides:
+ * unzip it, read ppt/slides/slideN.xml in numeric order, and turn each slide's
+ * text runs into an <h2> (title) followed by <p> lines. The result goes through
+ * the same DOMPurify + generateJSON pipeline as every other import.
+ */
+function pptxToHtml(buffer: ArrayBuffer): string {
+  const files = unzipSync(new Uint8Array(buffer));
+
+  const slidePaths = Object.keys(files)
+    .filter((path) => /^ppt\/slides\/slide\d+\.xml$/.test(path))
+    .sort((a, b) => {
+      const na = Number(a.match(/(\d+)\.xml$/)?.[1] ?? 0);
+      const nb = Number(b.match(/(\d+)\.xml$/)?.[1] ?? 0);
+      return na - nb;
+    });
+
+  if (slidePaths.length === 0) {
+    throw new Error("No slides found in that presentation.");
+  }
+
+  const decoder = new TextDecoder("utf-8");
+  const parser = new DOMParser();
+
+  const slides = slidePaths.map((path, index) => {
+    const xml = decoder.decode(files[path]);
+    const doc = parser.parseFromString(xml, "application/xml");
+    const runs = Array.from(doc.getElementsByTagName("a:t"))
+      .map((n) => (n.textContent ?? "").trim())
+      .filter(Boolean);
+    if (runs.length === 0) return "";
+
+    const [title, ...body] = runs;
+    const heading = title || `Slide ${index + 1}`;
+    return (
+      `<h2>${escapeHtml(heading)}</h2>` +
+      body.map((line) => `<p>${escapeHtml(line)}</p>`).join("")
+    );
+  });
+
+  const html = slides.filter(Boolean).join("");
+  if (!html) throw new Error("That presentation has no extractable text.");
+  return html;
 }

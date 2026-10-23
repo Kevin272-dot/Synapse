@@ -23,6 +23,8 @@ import {
 import {
   getDocumentActivity,
   getVersionText,
+  listSuggestions,
+  rejectSuggestion,
   type ActivityEntry,
 } from "@/lib/actions";
 import { cursorColor } from "@/lib/editor/remote-cursors";
@@ -30,6 +32,7 @@ import { ConfirmDialog } from "@/components/confirm-dialog";
 
 type Flashcard = { front: string; back: string };
 type QuizQ = { question: string; options: string[]; answerIndex: number };
+type SuggestionRow = Awaited<ReturnType<typeof listSuggestions>>[number];
 
 export default function AiPanel({
   docId,
@@ -38,6 +41,11 @@ export default function AiPanel({
   initialSummary,
   initialFlashcards,
   initialQuiz,
+  canSuggest = false,
+  canApply = false,
+  currentUserId,
+  onSuggest,
+  onAccept,
 }: {
   docId: string;
   editable?: boolean;
@@ -46,6 +54,21 @@ export default function AiPanel({
   initialSummary?: string | null;
   initialFlashcards?: Flashcard[] | null;
   initialQuiz?: QuizQ[] | null;
+  /** Roles below viewer can propose edits (suggestion mode). */
+  canSuggest?: boolean;
+  /** Owner/editor can apply suggestions. */
+  canApply?: boolean;
+  /** Used to let authors withdraw their own suggestions. */
+  currentUserId?: string;
+  /** Anchors against the live selection inside the editor. */
+  onSuggest?: (suggestedText: string) => Promise<string | null>;
+  /** Locates + applies the suggestion through the OT pipeline. */
+  onAccept?: (s: {
+    id: string;
+    position: number;
+    originalText: string;
+    suggestedText: string;
+  }) => Promise<string | null>;
 }) {
   const [open, setOpen] = useState(false);
   const [summary, setSummary] = useState<string | null>(initialSummary ?? null);
@@ -58,8 +81,13 @@ export default function AiPanel({
   const [error, setError] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Set<number>>(new Set());
   const [quizAnswers, setQuizAnswers] = useState<Record<number, number>>({});
-  const [tab, setTab] = useState<"ai" | "activity">("ai");
+  const [tab, setTab] = useState<"ai" | "activity" | "suggestions">("ai");
   const [activity, setActivity] = useState<ActivityEntry[] | null>(null);
+  const [suggestions, setSuggestions] = useState<SuggestionRow[] | null>(null);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  const [suggestText, setSuggestText] = useState("");
+  const [suggestBusy, setSuggestBusy] = useState(false);
+  const [suggestError, setSuggestError] = useState<string | null>(null);
   const [activityLoading, setActivityLoading] = useState(false);
   const [previewVersion, setPreviewVersion] = useState<number | null>(null);
   const [previewText, setPreviewText] = useState<string | null>(null);
@@ -154,14 +182,14 @@ export default function AiPanel({
           {/* Header */}
           <div className="flex items-center justify-between border-b border-slate-900/10 px-4 py-3 dark:border-white/10">
             <div className="flex items-center gap-2">
-              {tab === "ai" ? (
-                <Sparkles className="h-4 w-4 text-slate-500 dark:text-slate-400" />
-              ) : (
-                <History className="h-4 w-4 text-slate-500 dark:text-slate-400" />
-              )}
-              <h2 className="text-sm font-semibold">
-                {tab === "ai" ? "Synapse AI" : "Activity"}
-              </h2>
+            {tab === "ai" ? (
+              <Sparkles className="h-4 w-4 text-slate-500 dark:text-slate-400" />
+            ) : (
+              <History className="h-4 w-4 text-slate-500 dark:text-slate-400" />
+            )}
+            <h2 className="text-sm font-semibold">
+              {tab === "ai" ? "Synapse AI" : tab === "suggestions" ? "Suggestions" : "Activity"}
+            </h2>
             </div>
             <button
               type="button"
@@ -198,6 +226,33 @@ export default function AiPanel({
             >
               <History className="h-3.5 w-3.5" />
               Activity
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setTab("suggestions");
+                if (suggestions === null && !suggestionsLoading) {
+                  setSuggestionsLoading(true);
+                  listSuggestions(docId)
+                    .then(setSuggestions)
+                    .catch(() => setSuggestions([]))
+                    .finally(() => setSuggestionsLoading(false));
+                }
+              }}
+              className={`inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium transition ${
+                tab === "suggestions"
+                  ? "bg-slate-900 text-white dark:bg-white dark:text-slate-900"
+                  : "text-slate-600 hover:bg-slate-900/5 dark:text-slate-300 dark:hover:bg-white/10"
+              }`}
+            >
+              <GraduationCap className="h-3.5 w-3.5" />
+              Suggestions
+              {suggestions &&
+                suggestions.filter((s) => s.status === "pending").length > 0 && (
+                  <span className="rounded-full bg-[#1a73e8] px-1.5 text-[10px] font-semibold text-white">
+                    {suggestions.filter((s) => s.status === "pending").length}
+                  </span>
+                )}
             </button>
           </div>
 
@@ -365,6 +420,171 @@ export default function AiPanel({
                 </p>
               )}
             </Section>
+          </div>
+          )}
+
+          {/* Suggestions tab */}
+          {tab === "suggestions" && (
+          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+            {suggestError && (
+              <p className="rounded-lg bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-500/10 dark:text-red-400">
+                {suggestError}
+              </p>
+            )}
+
+            {canSuggest && (
+              <div className="rounded-lg border border-slate-900/10 p-3 dark:border-white/10">
+                <p className="mb-1 text-xs font-medium text-slate-700 dark:text-slate-200">
+                  Suggest an edit
+                </p>
+                <p className="mb-2 text-[11px] text-slate-500 dark:text-slate-400">
+                  Select text in the document first (or leave the selection
+                  empty to insert at the cursor), then type your replacement.
+                </p>
+                <textarea
+                  value={suggestText}
+                  onChange={(e) => setSuggestText(e.target.value)}
+                  rows={3}
+                  placeholder="Your suggested text…"
+                  className="w-full resize-none rounded-md border border-slate-900/10 bg-white px-2 py-1.5 text-xs outline-none transition placeholder:text-slate-400 focus:border-[#1a73e8] dark:border-white/10 dark:bg-slate-800 dark:text-slate-100"
+                />
+                <button
+                  type="button"
+                  disabled={suggestBusy || !suggestText.trim()}
+                  onClick={async () => {
+                    if (!onSuggest) return;
+                    setSuggestBusy(true);
+                    setSuggestError(null);
+                    const err = await onSuggest(suggestText.trim());
+                    setSuggestBusy(false);
+                    if (err) {
+                      setSuggestError(err);
+                    } else {
+                      setSuggestText("");
+                      setSuggestionsLoading(true);
+                      listSuggestions(docId)
+                        .then(setSuggestions)
+                        .catch(() => setSuggestions([]))
+                        .finally(() => setSuggestionsLoading(false));
+                    }
+                  }}
+                  className="mt-2 inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-[#1a73e8] px-3 py-1.5 text-xs font-medium text-white transition hover:bg-[#1765cc] disabled:opacity-50"
+                >
+                  {suggestBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <GraduationCap className="h-3.5 w-3.5" />
+                  )}
+                  Propose suggestion
+                </button>
+              </div>
+            )}
+
+            {suggestionsLoading ? (
+              <div className="flex items-center justify-center py-8">
+                <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+              </div>
+            ) : suggestions && suggestions.length > 0 ? (
+              <ul className="space-y-2.5">
+                {suggestions.map((s) => {
+                  return (
+                    <li
+                      key={s.id}
+                      className="rounded-lg border border-slate-900/10 p-3 text-xs dark:border-white/10"
+                    >
+                      <div className="mb-1.5 flex items-center justify-between gap-2">
+                        <span className="font-medium text-slate-700 dark:text-slate-200">
+                          {s.authorName}
+                        </span>
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                            s.status === "pending"
+                              ? "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300"
+                              : s.status === "accepted"
+                                ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300"
+                                : "bg-slate-100 text-slate-500 dark:bg-white/10 dark:text-slate-400"
+                          }`}
+                        >
+                          {s.status}
+                        </span>
+                      </div>
+                      {s.originalText && (
+                        <p className="text-[11px] text-slate-400 dark:text-slate-500 line-through">
+                          {s.originalText.length > 140 ? s.originalText.slice(0, 140) + "…" : s.originalText}
+                        </p>
+                      )}
+                      {s.suggestedText && (
+                        <p className="mt-1 text-[11px] text-emerald-700 dark:text-emerald-300">
+                          {s.suggestedText.length > 140 ? s.suggestedText.slice(0, 140) + "…" : s.suggestedText}
+                        </p>
+                      )}
+                      {s.status === "pending" && (canApply || currentUserId === s.authorUserId) && (
+                        <div className="mt-2 flex gap-2">
+                          {canApply && onAccept && (
+                            <button
+                              type="button"
+                              disabled={suggestBusy}
+                              onClick={async () => {
+                                setSuggestBusy(true);
+                                setSuggestError(null);
+                                const err = await onAccept({
+                                  id: s.id,
+                                  position: s.position,
+                                  originalText: s.originalText,
+                                  suggestedText: s.suggestedText,
+                                });
+                                setSuggestBusy(false);
+                                if (err) setSuggestError(err);
+                                setSuggestionsLoading(true);
+                                listSuggestions(docId)
+                                  .then(setSuggestions)
+                                  .catch(() => setSuggestions([]))
+                                  .finally(() => setSuggestionsLoading(false));
+                              }}
+                              className="rounded-md bg-[#1a73e8] px-3 py-1 font-medium text-white transition hover:bg-[#1765cc] disabled:opacity-50"
+                            >
+                              Accept
+                            </button>
+                          )}
+                          {currentUserId === s.authorUserId && (
+                            <button
+                              type="button"
+                              disabled={suggestBusy}
+                              onClick={() => {
+                                setSuggestBusy(true);
+                                setSuggestError(null);
+                                rejectSuggestion(docId, s.id)
+                                  .catch((e: unknown) =>
+                                    setSuggestError(
+                                      e instanceof Error ? e.message : "Failed"
+                                    )
+                                  )
+                                  .finally(() => {
+                                    setSuggestBusy(false);
+                                    setSuggestionsLoading(true);
+                                    listSuggestions(docId)
+                                      .then(setSuggestions)
+                                      .catch(() => setSuggestions([]))
+                                      .finally(() => setSuggestionsLoading(false));
+                                  });
+                              }}
+                              className="rounded-md border border-slate-900/10 px-3 py-1 font-medium text-slate-600 transition hover:bg-slate-900/5 disabled:opacity-50 dark:border-white/10 dark:text-slate-300 dark:hover:bg-white/10"
+                            >
+                              {canApply ? "Reject" : "Withdraw"}
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <p className="py-8 text-center text-xs text-slate-400 dark:text-slate-500">
+                No suggestions yet. Editors and commenters can propose edits
+                from here.
+              </p>
+            )}
           </div>
           )}
 

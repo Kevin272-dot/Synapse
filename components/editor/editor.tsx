@@ -4,17 +4,18 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useEditor, EditorContent } from "@tiptap/react";
 import { useUser, useAuth } from "@clerk/nextjs";
-import { ArrowLeft, Check, FileText, Globe } from "lucide-react";
+import { ArrowLeft, Check, FileText, Globe, WifiOff } from "lucide-react";
 import EditorToolbar from "@/components/editor/toolbar";
 import EditorMenuBar from "@/components/editor/menu-bar";
 import AiPanel from "@/components/editor/ai-panel";
 import { ShareDialog } from "@/components/editor/share-dialog";
 import SlashMenu from "@/components/editor/slash-menu";
-import { saveDocument, renameDocument } from "@/lib/actions";
+import { saveDocument, renameDocument, createSuggestion, markSuggestionApplied } from "@/lib/actions";
 import { useCollabSocket } from "@/lib/ot/use-collab-socket";
+import { clearOfflineSnapshot } from "@/lib/offline-queue";
 import { docToText, diffToOp, applyRemoteOp, docPosToTextOffset, textOffsetToDocPos } from "@/lib/ot/editor-bridge";
 import { Logoot, type CrdtOp } from "@/lib/crdt/logoot";
-import type { Operation } from "@/lib/ot/engine";
+import type { Operation, OpComponent } from "@/lib/ot/engine";
 import { EDITOR_EXTENSIONS } from "@/lib/editor/extensions";
 import { RemoteCursors, remoteCursorsKey, cursorColor } from "@/lib/editor/remote-cursors";
 import "./editor.css";
@@ -27,16 +28,20 @@ type EditorProps = {
   initialSummary?: string | null;
   initialFlashcards?: unknown;
   initialQuiz?: unknown;
-  role?: "owner" | "editor" | "viewer";
+  role?: "owner" | "editor" | "commenter" | "viewer";
   editable?: boolean;
   isOwner?: boolean;
   visibility?: "private" | "public";
   syncEngine?: "ot" | "crdt";
+  /** Whether knowledge-graph extraction is enabled for this document. */
+  kgEnabled?: boolean;
+  /** Folder this document lives in, so "back" returns to the folder, not home. */
+  folderId?: string | null;
   collaborators?: {
     id: string;
     name: string;
     email: string;
-    role: "owner" | "editor" | "viewer";
+    role: "owner" | "editor" | "commenter" | "viewer";
   }[];
   ownerId?: string;
   currentUserId?: string;
@@ -57,8 +62,11 @@ export default function Editor({
   editable = true,
   isOwner = true,
   visibility = "private",
+  kgEnabled = true,
+  folderId = null,
   syncEngine = "ot",
   collaborators = [],
+  currentUserId,
 }: EditorProps) {
   const { user, isLoaded } = useUser();
   const { getToken } = useAuth();
@@ -162,11 +170,7 @@ export default function Editor({
         const op = diffToOp(before, after);
         if (op.length > 0) {
           lastTextRef.current = after;
-          if (engineRef.current === "crdt" && crdtMirrorRef.current) {
-            submitCrdt(translateOpToCrdt(op, crdtMirrorRef.current));
-          } else {
-            submitOp(op);
-          }
+          dispatchOp(op, after);
         }
       }
     },
@@ -181,7 +185,18 @@ export default function Editor({
   });
 
   // Real-time collaboration socket.
-  const { connected, denied, engine, peers, submitOp, submitCrdt, updatePresence } = useCollabSocket({
+  const {
+    connected,
+    denied,
+    engine,
+    peers,
+    queuedCount,
+    offlineSnapshot,
+    dismissOfflineSnapshot,
+    submitOp,
+    submitCrdt,
+    updatePresence,
+  } = useCollabSocket({
     docId,
     userId: clerkId,
     name: displayName,
@@ -214,7 +229,82 @@ export default function Editor({
         applyingRemoteRef.current = false;
       }
     },
+    onServerText: (serverText, syncEngine) => {
+      // Offline reconcile: the server's authoritative text may be missing
+      // edits we made (or restored from the IndexedDB snapshot) while the
+      // socket was down. Diffing server -> editor and shipping that delta
+      // as one ordinary op reuses the normal convergence pipeline; since a
+      // diff op transforms server text into our text by construction,
+      // both sides provably converge.
+      serverTextRef.current = { text: serverText, engine: syncEngine };
+      if (syncEngine === "crdt") return;
+      if (!editor || !editable) return;
+      reconcileFromServer(serverText);
+      serverTextRef.current = null;
+    },
   });
+
+  /** Latest SYNC server text, kept for reconcile when the editor mounts late. */
+  const serverTextRef = useRef<{ text: string; engine: "ot" | "crdt" } | null>(null);
+
+  /**
+   * Ship any delta between the server's current text and the editor's text
+   * (which may contain offline edits) as one ordinary op. Editor text stays
+   * unchanged — it is already what the user sees.
+   */
+  function reconcileFromServer(serverText: string) {
+    const current = lastTextRef.current;
+    if (serverText === current) return;
+    const op = diffToOp(serverText, current);
+    if (op.length === 0) return;
+    dispatchOp(op, current);
+  }
+
+  /**
+   * Route an OT op through the active engine's pipeline. `afterText` is the
+   * editor text after the op — handed to the offline queue when the socket
+   * is down so reloads can restore the edit.
+   */
+  function dispatchOp(op: Operation, afterText?: string) {
+    if (engineRef.current === "crdt" && crdtMirrorRef.current) {
+      submitCrdt(translateOpToCrdt(op, crdtMirrorRef.current), afterText);
+    } else {
+      submitOp(op, undefined, afterText);
+    }
+  }
+
+  // Restore edits persisted while offline in a previous tab session: diff
+  // what the server rendered against the snapshot, and ship the delta.
+  useEffect(() => {
+    if (!offlineSnapshot || !editor || !editable) return;
+    let cancelled = false;
+    void (async () => {
+      const current = lastTextRef.current;
+      if (offlineSnapshot !== current) {
+        const op = diffToOp(current, offlineSnapshot);
+        if (op.length > 0 && !cancelled) {
+          applyingRemoteRef.current = true;
+          try {
+            applyRemoteOp(editor, op);
+          } finally {
+            applyingRemoteRef.current = false;
+          }
+          lastTextRef.current = offlineSnapshot;
+          dirtyRef.current = true;
+          scheduleSave();
+          dispatchOp(op, offlineSnapshot);
+        }
+      }
+      if (!cancelled) {
+        dismissOfflineSnapshot();
+        await clearOfflineSnapshot(docId);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [offlineSnapshot, editor, editable, docId]);
 
   // Keep refs + CRDT mirror in sync with the engine the server reports.
   useEffect(() => {
@@ -230,6 +320,12 @@ export default function Editor({
   // Paint collaborators' carets/selection into the editor as decorations.
   useEffect(() => {
     if (!editor) return;
+    // SYNC may have arrived before the TipTap instance existed; reconcile now.
+    const st = serverTextRef.current;
+    if (st && st.engine !== "crdt" && editable) {
+      serverTextRef.current = null;
+      reconcileFromServer(st.text);
+    }
     const cursors = peers
       .filter((p) => p.cursor != null || p.selection)
       .map((p) => {
@@ -259,14 +355,95 @@ export default function Editor({
     void renameDocument(docId, trimmed);
   }
 
+  /* ===== Suggestion-mode plumbing ================================ */
+  // Anchors live in plain-text OT coordinates (docPosToTextOffset), so a
+  // suggestion keeps meaning the same text even after other ops arrive.
+  function getSuggestionAnchor(): { position: number; originalText: string } | null {
+    if (!editor) return null;
+    const { from, to, empty } = editor.state.selection;
+    const originalText = empty
+      ? ""
+      : editor.state.doc.textBetween(from, to, "\n", "\n");
+    const position = docPosToTextOffset(editor, from);
+    return { position, originalText };
+  }
+
+  async function handleSuggest(suggestedText: string): Promise<string | null> {
+    const anchor = getSuggestionAnchor();
+    if (!anchor) return "No anchor";
+    try {
+      await createSuggestion(docId, anchor.position, anchor.originalText, suggestedText);
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : "Could not create suggestion";
+    }
+  }
+
+  /**
+   * Accept a suggestion: locate `originalText` near its stored position in
+   * the CURRENT text (content anchoring), then produce an ordinary OT op
+   * (retain/delete/insert) and push it through the active engine pipeline.
+   * Convergence + audit trail stay intact because the change is just a rule.
+   */
+  async function handleAccept(s: {
+    id: string;
+    position: number;
+    originalText: string;
+    suggestedText: string;
+  }): Promise<string | null> {
+    if (!editor || !editable) return "Cannot edit this document";
+    const text = docToText(editor);
+    let target = -1;
+    if (s.originalText) {
+      if (text.startsWith(s.originalText, s.position)) {
+        target = s.position;
+      } else {
+        for (let off = 1; off <= 500 && target === -1; off++) {
+          if (s.position - off >= 0 && text.startsWith(s.originalText, s.position - off)) {
+            target = s.position - off;
+          } else if (text.startsWith(s.originalText, s.position + off)) {
+            target = s.position + off;
+          }
+        }
+      }
+      if (target === -1) return "The anchored text has moved too much; locate it manually.";
+    } else {
+      target = Math.max(0, Math.min(s.position, text.length));
+    }
+
+    // Already applied? (A collaborator may have applied it live.)
+    if (s.originalText && s.suggestedText && text.startsWith(s.suggestedText, target)) {
+      await markSuggestionApplied(docId, s.id).catch(() => {});
+      return null;
+    }
+
+    const op: OpComponent[] = [];
+    if (target > 0) op.push({ retain: target });
+    if (s.originalText) op.push({ delete: s.originalText.length });
+    if (s.suggestedText) op.push({ insert: s.suggestedText });
+    if (op.length === 0) return null;
+
+    applyRemoteOp(editor, op);
+    const after = docToText(editor);
+    lastTextRef.current = after;
+    dispatchOp(op, after);
+
+    try {
+      await markSuggestionApplied(docId, s.id);
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : "Applied but not marked";
+    }
+  }
+
   return (
     <div className="flex min-h-full flex-1 flex-col">
       {/* ===== Top chrome (sticky) ===== */}
       <header className="sticky top-0 z-20 border-b border-slate-900/10 bg-white dark:border-white/10 dark:bg-slate-900">
         <div className="mx-auto flex h-14 w-full max-w-6xl items-center gap-2 px-4 sm:gap-3 sm:px-6">
           <Link
-            href="/dashboard"
-            aria-label="Back to documents"
+            href={folderId ? `/dashboard?folder=${folderId}` : "/dashboard"}
+            aria-label={folderId ? "Back to folder" : "Back to documents"}
             className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-600 transition hover:bg-slate-900/5 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/10 dark:hover:text-slate-100"
           >
             <ArrowLeft className="h-5 w-5" />
@@ -338,6 +515,7 @@ export default function Editor({
             collaborators={collaborators}
             visibility={visibility}
             syncEngine={syncEngine}
+            kgEnabled={kgEnabled}
           />
 
           {/* Save status */}
@@ -357,6 +535,18 @@ export default function Editor({
                 <Check className="h-4 w-4 text-slate-500 dark:text-slate-400" />
                 <span className="hidden sm:inline">Saved to Synapse</span>
               </>
+            ) : !connected && editable ? (
+              <span
+                className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400"
+                title="You're offline. Edits are kept locally and will sync when the connection returns."
+              >
+                <WifiOff className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">
+                  {queuedCount > 0
+                    ? `Offline · ${queuedCount} unsynced`
+                    : "Offline — edits will sync"}
+                </span>
+              </span>
             ) : (
               <span className="hidden text-slate-300 dark:text-slate-600 sm:inline">
                 {connected ? "Connected" : "All changes saved"}
@@ -395,7 +585,6 @@ export default function Editor({
       {editable && editor && (
         <SlashMenu editor={editor} docId={docId} onDismiss={() => setSlashOpen(false)} />
       )}
-
       {/* ===== AI panel ===== */}
       <AiPanel
         docId={docId}
@@ -408,16 +597,17 @@ export default function Editor({
           const op = diffToOp(lastTextRef.current, targetText);
           if (op.length === 0) return;
           lastTextRef.current = targetText;
-          if (engineRef.current === "crdt" && crdtMirrorRef.current) {
-            submitCrdt(translateOpToCrdt(op, crdtMirrorRef.current));
-          } else {
-            submitOp(op);
-          }
+          dispatchOp(op, targetText);
           applyRemoteOp(editor, op);
         }}
         initialSummary={initialSummary ?? null}
         initialFlashcards={(initialFlashcards as never) ?? null}
         initialQuiz={(initialQuiz as never) ?? null}
+        canSuggest={role !== "viewer"}
+        canApply={role === "owner" || role === "editor"}
+        currentUserId={currentUserId}
+        onSuggest={handleSuggest}
+        onAccept={handleAccept}
       />
     </div>
   );

@@ -1,6 +1,7 @@
 "use client";
 
-import { SignUp } from "@clerk/nextjs";
+import { ClerkLoaded, ClerkLoading, SignUp } from "@clerk/nextjs";
+import { Loader2 } from "lucide-react";
 import Link from "next/link";
 
 function SynapseMark({ className = "h-4 w-4" }: { className?: string }) {
@@ -42,15 +43,29 @@ export default function SignUpPage() {
             </p>
           </div>
         </div>
-        <SignUp
-          key="sign-up"
-          appearance={{
-            elements: {
-              rootBox: "mx-auto w-full",
-              card: "rounded-xl border border-slate-900/10 bg-white shadow-sm dark:border-white/10 dark:bg-slate-900",
-            },
-          }}
-        />
+        <ClerkLoading>
+          <div className="flex min-h-[320px] items-center justify-center rounded-xl border border-slate-900/10 bg-white shadow-sm dark:border-white/10 dark:bg-slate-900">
+            <div className="flex flex-col items-center gap-3">
+              <Loader2 className="h-5 w-5 animate-spin text-slate-400" />
+              <p className="text-sm text-[#5f6368] dark:text-slate-400">
+                Preparing sign up
+              </p>
+            </div>
+          </div>
+        </ClerkLoading>
+        <ClerkLoaded>
+          <SignUp
+            key="sign-up"
+            appearance={{
+              elements: {
+                rootBox: "mx-auto w-full",
+                card: "rounded-xl border border-slate-900/10 bg-white shadow-sm dark:border-white/10 dark:bg-slate-900",
+                // The page already renders the Synapse logo above the card.
+                logoBox: "hidden",
+              },
+            }}
+          />
+        </ClerkLoaded>
       </div>
     </div>
   );

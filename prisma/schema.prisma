@@ -19,6 +19,42 @@ model User {
   concepts  Concept[]
   edges     ConceptEdge[]
   sharedWith DocumentShare[]
+  settings  UserSettings?
+}
+
+// Per-user defaults for document creation, imports, knowledge-graph extraction
+// and folder-wide quizzes. Absent row = DEFAULT_SETTINGS in lib/settings.ts.
+model UserSettings {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Sync engine for new documents and imports.
+  defaultEngine String @default("ot")
+  // Presentations (pptx) import as CRDT by default.
+  pptxEngine    String @default("crdt")
+  // Whether new documents start with knowledge-graph extraction enabled.
+  kgDefault     Boolean @default(true)
+
+  // Folder-wide quiz defaults.
+  quizQuestions         Int     @default(5)
+  quizIncludeSubfolders Boolean @default(true)
+  quizCrossDoc          Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Cached quiz generated across all documents in a folder (and its subfolders).
+model FolderQuiz {
+  id       String @id @default(cuid())
+  folderId String @unique
+  folder   Folder @relation(fields: [folderId], references: [id], onDelete: Cascade)
+  ownerId  String
+  payload  Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 model Folder {
@@ -35,6 +71,7 @@ model Folder {
   children Folder[] @relation("FolderTree")
 
   documents Document[]
+  quizzes   FolderQuiz[]
 }
 
 model Document {
@@ -48,6 +85,9 @@ model Document {
   // Sync engine for this document: "ot" (server-authoritative transform)
   // or "crdt" (decentralized Logoot merge, relayed by the server).
   syncEngine String  @default("ot")
+  // Whether the live knowledge graph is extracted for this document.
+  // Extraction now runs when the document is closed (last participant leaves).
+  kgEnabled Boolean  @default(true)
   // Text at version 0 (before the first logged op) — enables replay-based
   // reconstruction of any version from the operation log.
   logBaseText String? @db.Text
@@ -67,6 +107,7 @@ model Document {
   concepts    DocumentConcept[]
   shares      DocumentShare[]
   operations  DocumentOperation[]
+  suggestions Suggestion[]
   // Semantic search embedding (Gemini text-embedding-004, 768 dims, stored as JSON)
   embedding   Json?
 }
@@ -89,8 +130,27 @@ model DocumentOperation {
   @@index([documentId, createdAt])
 }
 
+/// A proposed edit (suggestion mode). Anchors are stored in PLAIN-TEXT OT
+/// coordinates so they keep pointing at the right text as other ops arrive.
+model Suggestion {
+  id          String   @id @default(cuid())
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  documentId  String
+  authorUserId String
+  authorName  String
+  baseVersion Int
+  position    Int      // start of the replaced range in plain-text coordinates at baseVersion
+  originalText String  // "" for pure insertions
+  suggestedText String
+  status      String   @default("pending") // pending | accepted | rejected
+  createdAt   DateTime @default(now())
+  decidedAt   DateTime?
+
+  @@index([documentId, status])
+}
+
 /// Grants a user access to a document they don't own.
-/// role: "editor" (can edit + collab) | "viewer" (read-only).
+/// role: "editor" | "commenter" | "viewer" (read-only).
 model DocumentShare {
   id         String   @id @default(cuid())
   document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)

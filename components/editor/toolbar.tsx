@@ -26,6 +26,11 @@ import {
   ChevronDown,
   Link2,
   RemoveFormatting,
+  Table as TableIcon,
+  Image as ImageIcon,
+  Subscript as SubscriptIcon,
+  Superscript as SuperscriptIcon,
+  Rows3,
 } from "lucide-react";
 
 type ToolbarProps = { editor: Editor | null };
@@ -556,12 +561,128 @@ export default function EditorToolbar({ editor }: ToolbarProps) {
         <Minus className="h-4 w-4" />
       </ToolbarButton>
 
+      {/* Table */}
+      <Popover
+        trigger={() => (
+          <button
+            type="button"
+            title="Insert table"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition hover:bg-slate-900/5 dark:text-slate-400 dark:hover:bg-white/10"
+          >
+            <TableIcon className="h-4 w-4" />
+          </button>
+        )}
+      >
+        {(close) => (
+          <div className="p-2">
+            <p className="mb-2 text-xs font-medium text-slate-500">Table size</p>
+            <div className="grid grid-cols-4 gap-0.5">
+              {Array.from({ length: 16 }, (_, i) => {
+                const rows = Math.floor(i / 4) + 1;
+                const cols = (i % 4) + 1;
+                return (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => {
+                      ed.chain().focus().insertTable({ rows, cols, withHeaderRow: true }).run();
+                      close();
+                    }}
+                    className="flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-white text-xs text-slate-400 transition hover:border-[#1a73e8] hover:text-[#1a73e8] dark:border-slate-600 dark:bg-slate-700 dark:hover:border-[#8ab4f8]"
+                  >
+                    {rows}×{cols}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </Popover>
+
+      {/* Image */}
+      <Popover
+        align="right"
+        trigger={() => (
+          <button
+            type="button"
+            title="Insert image"
+            className="inline-flex h-8 w-8 items-center justify-center rounded-md text-slate-600 transition hover:bg-slate-900/5 dark:text-slate-400 dark:hover:bg-white/10"
+          >
+            <ImageIcon className="h-4 w-4" />
+          </button>
+        )}
+      >
+        {(close) => (
+          <div className="p-2">
+            {/* Local file upload: embedded as a data URL so no storage service
+                is needed; the rich content JSON carries the image itself. */}
+            <label
+              className="flex w-56 cursor-pointer items-center justify-center gap-2 rounded-md border border-dashed border-slate-300 bg-slate-900/[0.02] px-3 py-2 text-xs font-medium text-slate-600 transition hover:border-[#1a73e8] hover:bg-[#e8f0fe] dark:border-white/15 dark:text-slate-300 dark:hover:border-[#8ab4f8] dark:hover:bg-[#1a73e8]/10"
+            >
+              Upload image
+              <input
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  if (!file.type.startsWith("image/")) return;
+                  const reader = new FileReader();
+                  reader.onload = () => {
+                    const src = typeof reader.result === "string" ? reader.result : null;
+                    if (src && src.length <= 5_000_000) {
+                      ed.chain().focus().setImage({ src }).run();
+                    }
+                    close();
+                  };
+                  reader.readAsDataURL(file);
+                }}
+              />
+            </label>
+            <p className="my-2 text-center text-[11px] text-slate-400">or paste a URL below</p>
+            <input
+              autoFocus
+              placeholder="https://example.com/image.png"
+              className="w-56 rounded-md border border-[#dadce0] bg-transparent px-2 py-1 text-sm text-foreground outline-none dark:border-white/15 dark:bg-slate-800"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const url = (e.target as HTMLInputElement).value.trim();
+                  if (url) ed.chain().focus().setImage({ src: url }).run();
+                  close();
+                }
+              }}
+            />
+          </div>
+        )}
+      </Popover>
+
+      <Divider />
+
       {/* Clear formatting */}
       <ToolbarButton
         label="Clear formatting"
         onClick={() => ed.chain().focus().clearNodes().unsetAllMarks().run()}
       >
         <RemoveFormatting className="h-4 w-4" />
+      </ToolbarButton>
+
+      {/* Subscript */}
+      <ToolbarButton
+        label="Subscript"
+        active={ed.isActive("subscript")}
+        onClick={() => ed.chain().focus().toggleSubscript().run()}
+      >
+        <SubscriptIcon className="h-4 w-4" />
+      </ToolbarButton>
+
+      {/* Superscript */}
+      <ToolbarButton
+        label="Superscript"
+        active={ed.isActive("superscript")}
+        onClick={() => ed.chain().focus().toggleSuperscript().run()}
+      >
+        <SuperscriptIcon className="h-4 w-4" />
       </ToolbarButton>
     </div>
   );

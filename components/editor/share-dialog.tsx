@@ -12,12 +12,14 @@ import {
   Globe,
   Lock,
   Cpu,
+  Sparkles,
 } from "lucide-react";
 import {
   shareDocument,
   revokeShare,
   setDocumentVisibility,
   setSyncEngine,
+  setDocumentKgEnabled,
 } from "@/lib/actions";
 import { ConfirmDialog } from "@/components/confirm-dialog";
 
@@ -25,7 +27,7 @@ export interface Collaborator {
   id: string;
   name: string;
   email: string;
-  role: "owner" | "editor" | "viewer";
+  role: "owner" | "editor" | "commenter" | "viewer";
 }
 
 export function ShareDialog({
@@ -34,21 +36,24 @@ export function ShareDialog({
   collaborators,
   visibility,
   syncEngine,
+  kgEnabled,
 }: {
   docId: string;
   isOwner: boolean;
   collaborators: Collaborator[];
   visibility: "private" | "public";
   syncEngine: "ot" | "crdt";
+  kgEnabled: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [email, setEmail] = useState("");
-  const [role, setRole] = useState<"editor" | "viewer">("editor");
+  const [role, setRole] = useState<"editor" | "commenter" | "viewer">("editor");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [isPending, startTransition] = useTransition();
   const [confirmPublic, setConfirmPublic] = useState(false);
+  const [kg, setKg] = useState(kgEnabled);
 
   function invite(e: React.FormEvent) {
     e.preventDefault();
@@ -127,6 +132,22 @@ export function ShareDialog({
     });
   }
 
+  function changeKg(next: boolean) {
+    if (!isOwner) return;
+    setError(null);
+    setKg(next);
+    startTransition(async () => {
+      try {
+        await setDocumentKgEnabled(docId, next);
+      } catch (err) {
+        setKg(!next);
+        setError(
+          err instanceof Error ? err.message : "Could not update knowledge graph"
+        );
+      }
+    });
+  }
+
   return (
     <>
       <button
@@ -197,12 +218,13 @@ export function ShareDialog({
                     <select
                       value={role}
                       onChange={(e) =>
-                        setRole(e.target.value as "editor" | "viewer")
+                        setRole(e.target.value as "editor" | "commenter" | "viewer")
                       }
                       aria-label="Role"
                       className="h-10 rounded-md border border-[#dadce0] bg-white px-2 text-sm text-[#202124] outline-none dark:border-white/15 dark:bg-slate-800 dark:text-slate-100"
                     >
                       <option value="editor">Editor</option>
+                      <option value="commenter">Commenter</option>
                       <option value="viewer">Viewer</option>
                     </select>
                     <button
@@ -317,6 +339,49 @@ export function ShareDialog({
                 {!isOwner && (
                   <p className="mt-2 text-xs text-[#5f6368] dark:text-slate-500">
                     Only the document owner can change the sync engine.
+                  </p>
+                )}
+              </div>
+
+              {/* Knowledge graph - per-document extraction toggle */}
+              <div className="mt-5 border-t border-[#e2e8f0] pt-4 dark:border-white/10">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={kg}
+                  onClick={() => changeKg(!kg)}
+                  disabled={!isOwner || isPending}
+                  className="flex w-full items-start justify-between gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-[#f8f9fa] disabled:opacity-60 dark:hover:bg-white/5"
+                >
+                  <span className="min-w-0">
+                    <span className="flex items-center gap-1.5 text-sm font-medium text-[#202124] dark:text-slate-100">
+                      <Sparkles className="h-3.5 w-3.5" />
+                      Knowledge graph
+                    </span>
+                    <span className="mt-0.5 block text-xs leading-relaxed text-[#5f6368] dark:text-slate-400">
+                      {kg
+                        ? "Concepts are extracted when the document is closed, then added to your graph."
+                        : "No concepts are extracted for this document."}
+                    </span>
+                  </span>
+                  <span
+                    aria-hidden
+                    className={`relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition ${
+                      kg
+                        ? "bg-slate-900 dark:bg-white"
+                        : "bg-slate-300 dark:bg-white/20"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-all dark:bg-slate-900 ${
+                        kg ? "left-[18px]" : "left-0.5"
+                      }`}
+                    />
+                  </span>
+                </button>
+                {!isOwner && (
+                  <p className="mt-1 px-3 text-xs text-[#5f6368] dark:text-slate-500">
+                    Only the document owner can change knowledge-graph settings.
                   </p>
                 )}
               </div>

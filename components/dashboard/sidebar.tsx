@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
-import { FileText, FolderOpen, Network, Users } from "lucide-react";
+import { FileText, FolderOpen, Network, Settings, Users } from "lucide-react";
 
 /** Google-Drive-style left navigation. */
 export default function Sidebar() {
@@ -21,25 +21,32 @@ export default function Sidebar() {
 
   const shared = searchParams.get("owner") === "shared";
   const isGraph = pathname.startsWith("/graph");
+  const isSettings = pathname.startsWith("/settings");
 
   const items = [
     {
       label: "My documents",
       href: "/dashboard",
       icon: FolderOpen,
-      active: !isGraph && !shared,
+      active: !isGraph && !isSettings && !shared,
     },
     {
       label: "Shared with me",
       href: "/dashboard?owner=shared",
       icon: Users,
-      active: !isGraph && shared,
+      active: !isGraph && !isSettings && shared,
     },
     {
       label: "Knowledge graph",
       href: "/graph",
       icon: Network,
       active: isGraph,
+    },
+    {
+      label: "Settings",
+      href: "/settings",
+      icon: Settings,
+      active: isSettings,
     },
   ];
 

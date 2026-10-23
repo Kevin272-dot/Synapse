@@ -82,6 +82,8 @@ export default async function DocPage({
         initialQuiz={doc.quiz}
         visibility={access.doc.visibility}
         syncEngine={access.doc.syncEngine}
+        kgEnabled={access.doc.kgEnabled}
+        folderId={doc.folderId ?? null}
         role={role}
         editable={editable}
         isOwner={role === "owner"}

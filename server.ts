@@ -37,6 +37,8 @@ interface DocState {
   version: number;
   /** Sync engine for this document. */
   engine: "ot" | "crdt";
+  /** Whether knowledge-graph extraction is enabled for this document. */
+  kgEnabled: boolean;
   ownerId: string;
   /**
    * Tail cache of the durable op log (OT mode). history[i] moves the doc
@@ -58,6 +60,7 @@ const docs = new Map<string, DocState>();
 const globalStore = globalThis as unknown as {
   __synapseDocs?: Map<string, DocState>;
   __synapseResetEngine?: (docId: string) => void;
+  __synapseSetKgEnabled?: (docId: string, enabled: boolean) => void;
   __synapseIO?: { to: (room: string) => { emit: (event: string, data: unknown) => void } };
 };
 globalStore.__synapseDocs = docs;
@@ -72,6 +75,13 @@ function resetDocEngine(docId: string) {
   docs.delete(docId);
 }
 globalStore.__synapseResetEngine = resetDocEngine;
+
+/** Called from server actions when the owner toggles the knowledge graph. */
+function setDocKgEnabled(docId: string, enabled: boolean) {
+  const state = docs.get(docId);
+  if (state) state.kgEnabled = enabled;
+}
+globalStore.__synapseSetKgEnabled = setDocKgEnabled;
 
 /** Absolute-version lookup into the tail cache. */
 function historyOp(state: DocState, v: number): Operation | undefined {
@@ -91,7 +101,7 @@ async function getDocState(docId: string): Promise<DocState> {
   const [doc, opRows] = await Promise.all([
     prisma.document.findUnique({
       where: { id: docId },
-      select: { text: true, syncEngine: true, ownerId: true },
+      select: { text: true, syncEngine: true, kgEnabled: true, ownerId: true },
     }),
     prisma.documentOperation.findMany({
       where: { documentId: docId },
@@ -113,6 +123,7 @@ async function getDocState(docId: string): Promise<DocState> {
     text,
     version,
     engine,
+    kgEnabled: doc?.kgEnabled ?? true,
     ownerId: doc?.ownerId ?? "",
     history: tail.map((r) => fromJSON(r.op)),
     historyStart,
@@ -177,9 +188,10 @@ function boundHistory(state: DocState) {
 }
 
 /**
- * Live KG quiescence: 4 seconds after the last op, extract concepts.
- * This is the "OT/CRDT stream → quiescence → incremental LLM → graph"
- * pipeline that makes the knowledge graph live, not batch.
+ * Idle window: 4 seconds after the last op, refresh the search embedding.
+ * Knowledge-graph extraction is deliberately NOT run here: it happens when the
+ * document is closed (last participant leaves) and only if the owner has the
+ * knowledge graph enabled for the document.
  */
 function scheduleKg(state: DocState) {
   if (state.kgTimer) clearTimeout(state.kgTimer);
@@ -187,7 +199,6 @@ function scheduleKg(state: DocState) {
     state.kgTimer = null;
     if (!state.text.trim()) return;
     try {
-      await runKgExtraction(state.docId, state.text, state.ownerId);
       // Generate embedding for semantic search (same quiescence window).
       const emb = await generateEmbedding(state.text);
       if (emb) {
@@ -201,9 +212,28 @@ function scheduleKg(state: DocState) {
         docId: state.docId,
       });
     } catch (e) {
-      console.error("[kg] quiescence extraction failed", e);
+      console.error("[kg] embedding refresh failed", e);
     }
   }, 4000);
+}
+
+/**
+ * Close-time knowledge-graph extraction: runs when the last participant
+ * leaves the document (and only if the document has the feature enabled).
+ */
+async function extractOnClose(docId: string) {
+  const state = docs.get(docId);
+  if (!state) return;
+  if (!state.kgEnabled) return;
+  if (!state.text.trim()) return;
+  try {
+    await runKgExtraction(state.docId, state.text, state.ownerId);
+    globalStore.__synapseIO?.to(`doc:${state.docId}`).emit("graph:update", {
+      docId: state.docId,
+    });
+  } catch (e) {
+    console.error("[kg] close-time extraction failed", e);
+  }
 }
 
 app.prepare().then(() => {
@@ -301,6 +331,9 @@ app.prepare().then(() => {
       myPresence = {
         clientId: existing?.clientId ?? socket.id,
         userId: user.id,
+        // The client identifies itself by Clerk id, so presence must carry it too
+        // (otherwise a user's own entry is not filtered out and their avatar shows twice).
+        clerkId: user.clerkId,
         name: user.name,
         cursor: existing?.cursor ?? null,
         selection: existing?.selection ?? null,
@@ -332,8 +365,8 @@ app.prepare().then(() => {
         clientOpId?: string;
       }) => {
         if (!currentDoc || currentDoc !== payload.docId) return;
-        // Viewers may watch but not edit.
-        if (myRole === "viewer") return;
+        // Viewers and commenters may watch but not edit.
+        if (myRole === "viewer" || myRole === "commenter") return;
         const { docId, baseVersion, op } = payload;
         const state = await getDocState(docId);
         // CRDT-engine documents use the dedicated relay below.
@@ -402,7 +435,7 @@ app.prepare().then(() => {
         authorName?: string;
       }) => {
         if (!currentDoc || currentDoc !== payload.docId) return;
-        if (myRole === "viewer") return;
+        if (myRole === "viewer" || myRole === "commenter") return;
         const { docId, ops } = payload;
         const state = docs.get(docId);
         if (!state || state.engine !== "crdt" || !state.rga) return;
@@ -460,16 +493,25 @@ app.prepare().then(() => {
 
     socket.on(EVENTS.LEAVE, () => {
       if (currentDoc) {
-        socket.leave(`doc:${currentDoc}`);
-        prunePresence(currentDoc);
+        const leftDoc = currentDoc;
+        socket.leave(`doc:${leftDoc}`);
+        prunePresence(leftDoc);
         currentDoc = null;
+        // Closed the document: if nobody is left in the room, extract concepts.
+        if ((io.sockets.adapter.rooms.get(`doc:${leftDoc}`)?.size ?? 0) === 0) {
+          void extractOnClose(leftDoc);
+        }
       }
     });
 
     socket.on("disconnect", () => {
       if (currentDoc) {
-        prunePresence(currentDoc);
+        const leftDoc = currentDoc;
+        prunePresence(leftDoc);
         currentDoc = null;
+        if ((io.sockets.adapter.rooms.get(`doc:${leftDoc}`)?.size ?? 0) === 0) {
+          void extractOnClose(leftDoc);
+        }
       }
     });
 

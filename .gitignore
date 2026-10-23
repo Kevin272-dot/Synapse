@@ -54,3 +54,8 @@ generated/
 
 # turbopack
 .turbo/
+
+# paper / research artifacts (LaTeX, docx exports, reference PDFs, tooling)
+paper/
+
+.commandcode/

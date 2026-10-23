@@ -8,6 +8,15 @@
  * queued. When a remote op (or an ack of our own) arrives, any queued op
  * that was based on an older version must be REBASED against the incoming
  * op so its positions stay correct.
+ *
+ * Offline editing: edits made while the socket is down are applied locally
+ * as usual and reflected in the editor text. Internally they are counted
+ * and the edited text is persisted in IndexedDB (see lib/offline-queue)
+ * so a tab crash or reload doesn't lose them. On every (re)JOIN the server
+ * sends SYNC with its current text; the editor then reconciles by diffing
+ * server text against ITS OWN text and shipping the delta as one ordinary
+ * op through the normal pipeline — so offline changes sync with the exact
+ * same convergence machinery as live edits.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -15,10 +24,16 @@ import { io, type Socket } from "socket.io-client";
 import { transform, type Operation } from "@/lib/ot/engine";
 import type { CrdtOp } from "@/lib/crdt/logoot";
 import { EVENTS } from "@/lib/ot/protocol";
+import {
+  saveOfflineSnapshot,
+  loadOfflineSnapshot,
+} from "@/lib/offline-queue";
 
 export interface CollabPeer {
   clientId: string;
   userId: string;
+  /** Clerk id of the peer. Used to exclude your own presence entry. */
+  clerkId?: string;
   name: string;
   cursor?: number | null;
   selection?: { from: number; to: number } | null;
@@ -47,6 +62,7 @@ export function useCollabSocket({
   getToken,
   onRemote,
   onRemoteCrdt,
+  onServerText,
 }: {
   docId: string;
   userId: string;
@@ -57,18 +73,42 @@ export function useCollabSocket({
   onRemote: (op: Operation, cursor?: number | null) => void;
   /** Called when relayed CRDT ops arrive (crdt-engine documents). */
   onRemoteCrdt?: (ops: CrdtOp[]) => void;
+  /** Called on every SYNC with the authoritative server text, so the
+   *  editor can reconcile offline edits by diff (OT mode). */
+  onServerText?: (serverText: string, engine: "ot" | "crdt") => void;
 }) {
   const socketRef = useRef<Socket | null>(null);
   const [connected, setConnected] = useState(false);
   const [denied, setDenied] = useState<string | null>(null);
   const [engine, setEngine] = useState<"ot" | "crdt">("ot");
   const [peers, setPeers] = useState<CollabPeer[]>([]);
+  const [queuedCount, setQueuedCount] = useState(0);
+  const [offlineSnapshot, setOfflineSnapshot] = useState<string | null>(null);
   const versionRef = useRef(0);
   const pendingRef = useRef<{ id: string; baseVersion: number; op: Operation }[]>([]);
   const opCounter = useRef(0);
+  /** CRDT ops queued while disconnected (order-independent; flush on join). */
+  const offlineCrdtRef = useRef<CrdtOp[]>([]);
 
   // Stable refs for the latest text/version so handlers don't go stale.
   const textRef = useRef("");
+  const onServerTextRef = useRef(onServerText);
+  onServerTextRef.current = onServerText;
+
+  const syncCount = useCallback(() => {
+    setQueuedCount(pendingRef.current.length + offlineCrdtRef.current.length);
+  }, []);
+
+  // Persisted-snapshot lookup: once per document mount.
+  useEffect(() => {
+    let alive = true;
+    loadOfflineSnapshot(docId).then((snap) => {
+      if (alive && snap && snap.text.length > 0) setOfflineSnapshot(snap.text);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [docId]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -98,14 +138,30 @@ export function useCollabSocket({
     socket.on(EVENTS.SYNC, (payload: any) => {
       textRef.current = payload.text;
       versionRef.current = payload.version;
-      // Clear pending; server is authoritative and we just joined.
-      pendingRef.current = [];
       setEngine(payload.engine === "crdt" ? "crdt" : "ot");
       setPeers(
         (payload.presence ?? []).filter(
-          (p: CollabPeer) => p.userId !== userId
+          (p: CollabPeer) => (p.clerkId ?? p.userId) !== userId
         )
       );
+      // SYNC means (re)join. Any still-unacked pending ops are already
+      // part of the editor text and will be re-shipped by the editor's
+      // diff reconcile below, so their in-flight bookkeeping is stale.
+      pendingRef.current = [];
+      syncCount();
+
+      // CRDT mode: replay any ops queued while we were offline. CRDT ops
+      // are order-independent, so late delivery still converges.
+      if (payload.engine === "crdt" && offlineCrdtRef.current.length > 0) {
+        const batch = offlineCrdtRef.current;
+        offlineCrdtRef.current = [];
+        socket.emit(EVENTS.CRDT_OPS, { docId, ops: batch });
+        syncCount();
+      }
+
+      // OT mode: the editor reconciles offline edits by diffing the server
+      // text against its own (see editor.tsx onServerText).
+      onServerTextRef.current?.(payload.text, payload.engine === "crdt" ? "crdt" : "ot");
     });
 
     socket.on(EVENTS.CRDT_APPLIED, (payload: { ops: CrdtOp[] }) => {
@@ -133,6 +189,7 @@ export function useCollabSocket({
           pendingRef.current = pendingRef.current.filter(
             (p) => p.id !== payload.originalOpId
           );
+          syncCount();
         }
 
         versionRef.current = payload.version;
@@ -159,7 +216,7 @@ export function useCollabSocket({
     socket.on(EVENTS.PRESENCE_UPDATE, (payload: any) => {
       setPeers(
         (payload.presence ?? []).filter(
-          (p: CollabPeer) => p.userId !== userId
+          (p: CollabPeer) => (p.clerkId ?? p.userId) !== userId
         )
       );
     });
@@ -174,14 +231,25 @@ export function useCollabSocket({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [docId, userId, enabled]);
 
-  /** Submit a local op (already applied to the editor) to the server. */
+  /** Submit a local op (already applied to the editor) to the server.
+   *  `afterText` lets the offline queue persist the edited text when we
+   *  are disconnected. */
   const submitOp = useCallback(
-    (op: Operation, cursor?: number | null) => {
+    (op: Operation, cursor?: number | null, afterText?: string) => {
       const socket = socketRef.current;
-      if (!socket || !connected) return;
+      if (!socket || !connected) {
+        // Offline: apply-only (the editor already applied it); count the
+        // change and persist the resulting text so a reload can restore.
+        setQueuedCount((c) => c + 1);
+        if (afterText && afterText.length <= 200_000) {
+          void saveOfflineSnapshot(docId, afterText);
+        }
+        return;
+      }
       const id = `op-${++opCounter.current}`;
       const baseVersion = versionRef.current;
       pendingRef.current.push({ id, baseVersion, op });
+      syncCount();
       // Send over the version we *know* the server has (baseVersion).
       socket.emit(EVENTS.OPERATION, {
         docId,
@@ -191,19 +259,29 @@ export function useCollabSocket({
         cursor,
       });
     },
-    [docId, connected]
+    [docId, connected, syncCount]
   );
 
   /** Submit Logoot CRDT ops (crdt-engine documents). The server relays
    *  them without transformation; our own echo is ignored via idempotent
-   *  applyRemote on the server replica. */
+   *  applyRemote on the server replica. While offline the ops queue and
+   *  replay on the next join. */
   const submitCrdt = useCallback(
-    (ops: CrdtOp[]) => {
+    (ops: CrdtOp[], afterText?: string) => {
       const socket = socketRef.current;
-      if (!socket || !connected || ops.length === 0) return;
+      if (!socket || !connected || ops.length === 0) {
+        if (ops.length > 0) {
+          offlineCrdtRef.current.push(...ops);
+          syncCount();
+          if (afterText && afterText.length <= 200_000) {
+            void saveOfflineSnapshot(docId, afterText);
+          }
+        }
+        return;
+      }
       socket.emit(EVENTS.CRDT_OPS, { docId, ops });
     },
-    [docId, connected]
+    [docId, connected, syncCount]
   );
 
   const updatePresence = useCallback(
@@ -213,11 +291,19 @@ export function useCollabSocket({
     [docId]
   );
 
+  /** Called by the editor once a persisted snapshot has been reconciled. */
+  const dismissOfflineSnapshot = useCallback(() => {
+    setOfflineSnapshot(null);
+  }, []);
+
   return {
     connected,
     denied,
     engine,
     peers,
+    queuedCount,
+    offlineSnapshot,
+    dismissOfflineSnapshot,
     submitOp,
     submitCrdt,
     updatePresence,
